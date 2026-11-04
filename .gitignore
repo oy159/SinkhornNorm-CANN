@@ -1,0 +1,11 @@
+build/
+.DS_Store
+__pycache__/
+*.pyc
+.idea/
+
+# CANNJudge credentials, sessions and local upload previews
+scripts/.cache/
+scripts/acounts.env
+scripts/accounts.env
+build-*/
