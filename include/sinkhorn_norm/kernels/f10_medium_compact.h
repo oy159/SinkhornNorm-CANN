@@ -3,6 +3,7 @@
 
 #include "kernel_operator.h"
 #include "sinkhorn_norm/tiling_data.h"
+#include "sinkhorn_norm/common/normalization_forecast.h"
 #include "sinkhorn_norm/kernels/f12_wide_blocked.h"
 
 namespace sinkhorn_norm {
@@ -38,30 +39,43 @@ static __aicore__ __attribute__((always_inline)) inline void WideRoundSpan(
   }
 }
 
+constexpr uint32_t kBlocked56ForecastSteps = 4;
+
+static __aicore__ __attribute__((always_inline)) inline void ScaleBlocked56Columns(
+    __ubuf__ float *matrix, __ubuf__ float *denom, uint32_t slabs) {
+  if ASCEND_IS_AIV {
+    for (uint32_t group = 0; group < 7; ++group) {
+      auto m = matrix + group * 64;
+      vmul(m, m, denom, slabs, 1, 1, 0, 56, 56, 1);
+    }
+    pipe_barrier(PIPE_V);
+  }
+}
+
 static __aicore__ __attribute__((always_inline)) inline void ColumnsBlocked56(
     __ubuf__ float *matrix, __ubuf__ float *partial, __ubuf__ float *ones,
-    __ubuf__ float *denom, __ubuf__ float *tmp, uint32_t valid, float eps) {
+    __ubuf__ float *denom, __ubuf__ float *tmp, uint32_t valid, float eps,
+    __ubuf__ float *capture = nullptr) {
   if ASCEND_IS_AIV {
     using namespace sinkhorn_f12;
     constexpr uint32_t h = 56;
-    const uint32_t q = h / 4, slabs = h / 8 * valid;
-    WideColAdd(partial, matrix, matrix + q * 8, q * 8, slabs, q, h,
-                         h);
+    const uint32_t q = h / 8, slabs = h / 8 * valid;
+    // All seven-row accumulation stages use the same mask and repeat strides.
+    // Keep the mask live until the following 7-to-4 reduction changes it.
+    WideMask((uint64_t{1} << (7 * 8)) - 1);
+    vadd(partial, matrix, matrix + q * 8, slabs, 1, 1, 1, q, h, h);
+    vadd(tmp, matrix + 4 * q * 8, matrix + 5 * q * 8,
+         slabs, 1, 1, 1, q, h, h);
     pipe_barrier(PIPE_V);
-    WideColAdd(partial, partial, matrix + 2 * q * 8, q * 8, slabs, q,
-                         q, h);
+    vadd(partial, partial, matrix + 2 * q * 8, slabs, 1, 1, 1, q, q, h);
+    vadd(tmp, tmp, matrix + 6 * q * 8, slabs, 1, 1, 1, q, q, h);
     pipe_barrier(PIPE_V);
-    WideColAdd(partial, partial, matrix + 3 * q * 8, q * 8, slabs, q,
-                         q, h);
+    vadd(partial, partial, matrix + 3 * q * 8, slabs, 1, 1, 1, q, q, h);
+    vadd(tmp, tmp, matrix + 7 * q * 8, slabs, 1, 1, 1, q, q, h);
     pipe_barrier(PIPE_V);
-    uint32_t height = q;
-    while (height > 8) {
-      const uint32_t half = height / 2, upper = height - half;
-      WideColAdd(partial, partial, partial + upper * 8, half * 8,
-                           slabs, q, q, q);
-      pipe_barrier(PIPE_V);
-      height = upper;
-    }
+    vadd(partial, partial, tmp, slabs, 1, 1, 1, q, q, q);
+    pipe_barrier(PIPE_V);
+    const uint32_t height = q;
     const uint32_t span = slabs * 8;
     const uint32_t half = height / 2, upper = height - half;
     WideMask((uint64_t{1} << (half * 8)) - 1);
@@ -82,19 +96,18 @@ static __aicore__ __attribute__((always_inline)) inline void ColumnsBlocked56(
     SetVectorMask<float, MaskMode::COUNTER>(0, span);
     vadd(denom, tmp, tmp + span, spanRepeats, 1, 1, 1, 8, 8, 8);
     pipe_barrier(PIPE_V);
+    if (capture != nullptr) {
+      vsub(capture, denom, ones, spanRepeats, 1, 1, 1, 8, 8, 8);
+      pipe_barrier(PIPE_V);
+    }
     vadds(denom, denom, eps, spanRepeats, 1, 1, 8, 8);
     pipe_barrier(PIPE_V);
     vdiv(denom, ones, denom, spanRepeats, 1, 1, 1, 8, 8, 8);
     pipe_barrier(PIPE_V);
     SetMaskNorm();
     SetVectorMask<float, MaskMode::NORMAL>(0, ~uint64_t{0});
-    // Traverse corresponding row groups across all column/token slabs in one
-    // repeat sequence, instead of issuing one instruction per slab.
-    for (uint32_t group = 0; group < h / 8; ++group) {
-      auto m = matrix + group * 64;
-      vmul(m, m, denom, slabs, 1, 1, 0, h, h, 1);
-    }
-    pipe_barrier(PIPE_V);
+    // One repeat sequence covers the same rows of every column slab.
+    ScaleBlocked56Columns(matrix, denom, slabs);
   }
 }
 
@@ -103,7 +116,7 @@ static __aicore__ __attribute__((always_inline)) inline void ColumnsBlocked56(
 static __aicore__ __attribute__((always_inline)) inline void RunBlocked56(
     __ubuf__ float *matrix, __ubuf__ float *partial, __ubuf__ float *tmp,
     __ubuf__ float *result, __ubuf__ float *ones, __ubuf__ float *denom,
-    uint32_t valid, float eps, uint32_t iterations) {
+    uint32_t valid, float eps, uint32_t iterations, uint32_t capacity) {
   if ASCEND_IS_AIV {
     using namespace sinkhorn_f12;
     const uint32_t rows = 56 * valid, plane = rows * 8;
@@ -115,14 +128,35 @@ static __aicore__ __attribute__((always_inline)) inline void RunBlocked56(
     auto phaseZero = tmpPhase == 0 ? tmp : opposite;
     auto phaseHalf = tmpPhase == 0 ? opposite : tmp;
     InitWide(matrix, partial, tmp, result, 56, valid);
+    constexpr uint32_t tail = 8;
+    const bool forecast = iterations >= 4 + tail + kBlocked56ForecastSteps &&
+        capacity >= 12 * rows + 128 && eps >= 0x1p-24f && eps <= 1.0e-5f;
+    const uint32_t checkpoint = forecast ? iterations - tail - kBlocked56ForecastSteps : iterations;
+    auto history = forecast ? partial + capacity - 4 * rows : partial;
     for (uint32_t round = 0; round < iterations; ++round) {
-      WideRows<false>(matrix, partial, result, rows, 7);
-      if (round != 0) {
-        WideSpan<1>(result, result, result, rows, eps);
+      const bool predict = round == checkpoint;
+      const bool measure = forecast && round < checkpoint && round + 2 >= checkpoint;
+      auto snapshot = history + (round % 2) * 2 * rows;
+      if (predict) {
+        ForecastDenominatorProduct(result, denom, partial, tmp, ones,
+                          history + ((round - 1) % 2) * 2 * rows, snapshot, rows, eps);
+      } else {
+        WideRows<false>(matrix, partial, result, rows, 7);
+        if (measure) {
+          SetMaskCount();
+          SetVectorMask<float, MaskMode::COUNTER>(0, rows);
+          vsub(snapshot, result, ones, (rows + 63) / 64, 1, 1, 1, 8, 8, 8);
+          pipe_barrier(PIPE_V);
+          SetMaskNorm();
+          WideRoundMask(~uint64_t{0});
+        }
+        if (round != 0) {
+          WideSpan<1>(result, result, result, rows, eps);
+          pipe_barrier(PIPE_V);
+        }
+        WideSpan<2>(result, ones, result, rows);
         pipe_barrier(PIPE_V);
       }
-      WideSpan<2>(result, ones, result, rows);
-      pipe_barrier(PIPE_V);
       vbrcb(reinterpret_cast<__ubuf__ uint32_t *>(phaseHalf),
             reinterpret_cast<__ubuf__ uint32_t *>(result), 1, 8, rows / 8);
       if ((plane * sizeof(float)) & 511u)
@@ -139,7 +173,13 @@ static __aicore__ __attribute__((always_inline)) inline void RunBlocked56(
         WideSpan<1>(matrix, matrix, matrix, rows * 56, eps);
         pipe_barrier(PIPE_V);
       }
-      ColumnsBlocked56(matrix, partial, ones, denom, tmp, valid, eps);
+      if (predict) {
+        ScaleBlocked56Columns(matrix, denom, 7 * valid);
+        round += kBlocked56ForecastSteps - 1;
+      } else {
+        ColumnsBlocked56(matrix, partial, ones, denom, tmp, valid, eps,
+                         measure ? snapshot + rows : nullptr);
+      }
     }
   }
 }
@@ -304,8 +344,20 @@ static __aicore__ __attribute__((always_inline)) inline void RunWideCompleteRoun
 class MediumCompactKernel {
  public:
   __aicore__ inline void Init(GM_ADDR mixes, GM_ADDR pre, GM_ADDR post,
-                              GM_ADDR comb, const sinkhorn_norm::TilingData &t) {
-    t_ = t;
+                              GM_ADDR comb, const sinkhorn_norm::MediumCompactArgs &t) {
+    t_ = {};
+    t_.eps = t.eps;
+    t_.iters = t.iters;
+    t_.h = t.h;
+    t_.h_pad = (t.h + 7) / 8 * 8;
+    t_.tile_tokens = t.tile;
+    t_.tokens_per_core = t.owner;
+    t_.extra_core_count = t.extra;
+    t_.input_width = t.h * (t.h + 2);
+    const uint32_t rows = t.h * t.tile, span = t_.h_pad * t.tile;
+    t_.input_bytes = t.input_bytes;
+    t_.matrix_bytes = 4 * rows * t_.h_pad;
+    t_.gate_bytes = 4 * span;
     const uint64_t core = GetBlockIdx();
     start_ = core * t_.tokens_per_core +
              (core < t_.extra_core_count ? core : t_.extra_core_count);
@@ -317,9 +369,9 @@ class MediumCompactKernel {
     comb_.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(comb));
 
     const uint32_t rp = (t_.h * t_.tile_tokens + 7) / 8 * 8;
-    const uint32_t span = t_.tile_tokens * t_.h_pad;
-    const uint32_t ones = rp > 2 * span ? rp : 2 * span;
-    const uint32_t tmp = 8 * rp > 6 * span ? 8 * rp : 6 * span;
+    const uint32_t gateSpan = t_.tile_tokens * t_.h_pad;
+    const uint32_t ones = rp > 2 * gateSpan ? rp : 2 * gateSpan;
+    const uint32_t tmp = 8 * rp > 6 * gateSpan ? 8 * rp : 6 * gateSpan;
 
     pipe_.InitBuffer(matrixBuffer_, t_.matrix_bytes);
     pipe_.InitBuffer(gateBuffer_, 2 * t_.gate_bytes);
@@ -327,7 +379,7 @@ class MediumCompactKernel {
     pipe_.InitBuffer(tmpBuffer_, tmp * sizeof(float));
     pipe_.InitBuffer(resultBuffer_, rp * sizeof(float));
     pipe_.InitBuffer(onesBuffer_, ones * sizeof(float));
-    pipe_.InitBuffer(denomBuffer_, span * sizeof(float));
+    pipe_.InitBuffer(denomBuffer_, gateSpan * sizeof(float));
 
     matrix_ = matrixBuffer_.Get<float>();
     gates_ = gateBuffer_.Get<float>();
@@ -362,7 +414,7 @@ class MediumCompactKernel {
             reinterpret_cast<__ubuf__ float *>(result_.GetPhyAddr()),
             reinterpret_cast<__ubuf__ float *>(ones_.GetPhyAddr()),
             reinterpret_cast<__ubuf__ float *>(denom_.GetPhyAddr()),
-            valid_, t_.eps, t_.iters);
+            valid_, t_.eps, t_.iters, t_.input_bytes / sizeof(float));
         CopyOutBlocked56(first);
       } else {
         CopyIn(first);
@@ -725,7 +777,7 @@ class MediumCompactKernel {
 template <int = 0>
 __global__ __aicore__ __attribute__((aligned(64))) void sinkhorn_f10_kernel(
     GM_ADDR mixes, GM_ADDR pre, GM_ADDR post, GM_ADDR comb,
-    sinkhorn_norm::TilingData tiling) {
+    sinkhorn_norm::MediumCompactArgs tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   sinkhorn_norm::f10::MediumCompactKernel op;
   op.Init(mixes, pre, post, comb, tiling);

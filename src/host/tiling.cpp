@@ -21,9 +21,10 @@ struct BufferSizes {
   std::uint64_t matrix;
   std::uint64_t gate;
   std::uint64_t scratch;
+  std::uint64_t reserved = kReservedBytes;
 
   std::uint64_t Total() const {
-    return input + matrix + 2 * gate + scratch + kReservedBytes;
+    return input + matrix + 2 * gate + scratch + reserved;
   }
 
   bool FitsMetadata() const {
@@ -211,7 +212,9 @@ bool MakeTiling(const Problem &problem, const PlatformResources &platform,
         rotating_sizes.matrix = 132352;
         rotating_sizes.input = 33024;
         const auto rows = h * lower, span = h_pad * lower;
-        rotating_sizes.scratch = 4 * (17 * rows + 3 * span);
+        rotating_sizes.scratch = 4 * (17 * rows + 5 * span) + 256;
+        // Explicit extra history uses 2 KiB of the original 8 KiB reserve.
+        rotating_sizes.reserved = kReservedBytes - 8 * span;
         const bool amortized =
             problem.iters >= 12 &&
             tokens_per_core >= static_cast<std::uint64_t>(
@@ -261,6 +264,15 @@ bool MakeTiling(const Problem &problem, const PlatformResources &platform,
             alternate_sizes.Total() <= platform.ub_bytes &&
             alternate_sizes.FitsMetadata()) {
           sizes = alternate_sizes;
+          if (lower == 4 && problem.iters >= 17 &&
+              problem.eps >= 0x1p-24f && problem.eps <= 1.0e-5f) {
+            auto with_history = sizes;
+            with_history.scratch += kAlignedMediumFactorHistoryBytes;
+            if (with_history.Total() <= platform.ub_bytes &&
+                with_history.FitsMetadata()) {
+              sizes = with_history;
+            }
+          }
         }
       }
       use_interleaved = true;
@@ -324,6 +336,16 @@ bool MakeTiling(const Problem &problem, const PlatformResources &platform,
       use_interleaved = true;
       selected_tile = lower;
       selected_sizes = sizes;
+      const auto tile = std::min<std::uint64_t>(64, (max_core_tokens + 15) / 16 * 16);
+      if (IsLongNarrowPlaneWorkload(h, h_pad, problem.iters, tokens_per_core,
+                                    tile, problem.eps)) {
+        const BufferSizes planes{DenseNarrowInputBytes(h, tile), DenseNarrowMatrixBytes(h, tile),
+                                 4 * 16 * tile, DenseNarrowScratchBytes(h, tile)};
+        if (planes.Total() <= platform.ub_bytes && planes.FitsMetadata()) {
+          selected_tile = tile;
+          selected_sizes = planes;
+        }
+      }
     }
   }
 

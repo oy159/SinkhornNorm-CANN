@@ -16,6 +16,28 @@ static __aicore__ __attribute__((always_inline)) inline void Mask64(U64 mask) {
   SetVectorMask<float,MaskMode::NORMAL>(U64{0},mask);
 }
 
+static __aicore__ inline void CopyFactors(UBFloat *dst,UBFloat *src,
+                                         uint8_t repeats) {
+  if ASCEND_IS_AIV {
+    vcopy(reinterpret_cast<__ubuf__ U32 *>(dst),
+          reinterpret_cast<__ubuf__ U32 *>(src),repeats,1,1,8,8);
+  }
+}
+
+static __aicore__ inline void PredictFactors(UBFloat *dst,UBFloat *history,
+    UBFloat *work,U32 span,uint8_t repeats,U32 round) {
+  if ASCEND_IS_AIV {
+    auto latest=history+((round-1)%2)*span;
+    auto prior=history+(round%2)*span;
+    vsub(work,latest,prior,repeats,1,1,1,8,8,8);
+    CopyFactors(dst,latest,repeats);
+    pipe_barrier(PIPE_V);
+    vaxpy(dst,work,0.8f,repeats,1,1,8,8);
+    pipe_barrier(PIPE_V);
+    CopyFactors(prior,dst,repeats);
+  }
+}
+
 template <bool P>
 static __aicore__ __attribute__((always_inline)) inline void Rounds64(
     UBFloat *a,UBFloat *b,
@@ -23,7 +45,7 @@ static __aicore__ __attribute__((always_inline)) inline void Rounds64(
     UBFloat *__restrict w,UBFloat *__restrict r,
     UBFloat *__restrict u,UBFloat *__restrict d,
     U32 tokens,U32 cap,U32 uo,
-    float eps,U32 rounds) {
+    float eps,U32 rounds,UBFloat *history=nullptr) {
   if ASCEND_IS_AIV {
     constexpr U32 lanes=64,h=lanes;
     constexpr bool pk=P;
@@ -80,27 +102,37 @@ static __aicore__ __attribute__((always_inline)) inline void Rounds64(
     SetMaskNorm();
     Mask64(~U64{0});
 
+    const U32 first=rounds/3>8?rounds/3:8;
+    const U32 limit=rounds>9?rounds-9:0;
+    const U32 last=limit<first+2?limit:first+2;
     for (U32 round=0; round < rounds; ++round) {
+      const bool capture=history && round>=first-2 && round<=last;
+      const bool predict=capture && (round==first || round==first+2);
       if (round > 0) {
-        if constexpr (P) {
-          // All 256 full nr,split only for the NORMAL repeat limit.
-          vcgadd(w,a,128,1,1,8);
-          vcgadd(w + 1024,a + 8192,128,1,1,8);
+        if (predict) {
+          PredictFactors(r,history,w,nr,nv,round);
         } else {
-          SetMaskCount();
-          SetVectorMask<float,MaskMode::COUNTER>(0,nr * h);
-          vcgadd(p,a,1,1,1,8);
+          if constexpr (P) {
+            // All 256 full nr,split only for the NORMAL repeat limit.
+            vcgadd(w,a,128,1,1,8);
+            vcgadd(w + 1024,a + 8192,128,1,1,8);
+          } else {
+            SetMaskCount();
+            SetVectorMask<float,MaskMode::COUNTER>(0,nr * h);
+            vcgadd(p,a,1,1,1,8);
+            pipe_barrier(PIPE_V);
+            SetMaskNorm();
+            Mask64(~U64{0});
+          }
+          vcgadd(r,P ? w : p,nr / 8,1,1,8);
           pipe_barrier(PIPE_V);
-          SetMaskNorm();
-          Mask64(~U64{0});
+          vadds(r,r,eps,nv,1,1,8,8);
+          pipe_barrier(PIPE_V);
+          // Use the other initialized constant phase when both row operands align.
+          vdiv(r,u + uo,r,nv,1,1,1,8,8,8);
+          pipe_barrier(PIPE_V);
+          if (capture) CopyFactors(history+(round%2)*nr,r,nv);
         }
-        vcgadd(r,P ? w : p,nr / 8,1,1,8);
-        pipe_barrier(PIPE_V);
-        vadds(r,r,eps,nv,1,1,8,8);
-        pipe_barrier(PIPE_V);
-        // Use the other initialized constant phase when both row operands align.
-        vdiv(r,u + uo,r,nv,1,1,1,8,8,8);
-        pipe_barrier(PIPE_V);
         vbrcb(reinterpret_cast<__ubuf__ U32 *>(w),
               reinterpret_cast<__ubuf__ U32 *>(r),1,8,nr / 8);
         if constexpr (!P) pipe_barrier(PIPE_V);
@@ -118,65 +150,73 @@ static __aicore__ __attribute__((always_inline)) inline void Rounds64(
           Mask64(~U64{0});
         }
       }
-      auto columnSum=p;
-      if (n == 4 && hf) {
-        // Direct unrolled straight-line column binary tree (JP6: H=64,s=256)
-        // Row scaling already wrote row/token-interleaved data.
-        vadd(p,b,b + 32 * s,128,1,1,1,8,8,8);
-        if constexpr (!P) pipe_barrier(PIPE_V);
-        if (pk && b != a) {
-          auto other=a + 64;
-          vadd(other,p,p + 16 * s,64,1,1,1,8,8,8);
-          vadd(p,other,other + 8 * s,32,1,1,1,8,8,8);
-          vadd(other,p,p + 4 * s,16,1,1,1,8,8,8);
+      if (!predict) {
+        auto columnSum=p;
+        if (n == 4 && hf) {
+          // Direct unrolled straight-line column binary tree (JP6: H=64,s=256)
+          // Row scaling already wrote row/token-interleaved data.
+          vadd(p,b,b + 32 * s,128,1,1,1,8,8,8);
+          if constexpr (!P) pipe_barrier(PIPE_V);
+          if (pk && b != a) {
+            auto other=a + 64;
+            vadd(other,p,p + 16 * s,64,1,1,1,8,8,8);
+            vadd(p,other,other + 8 * s,32,1,1,1,8,8,8);
+            vadd(other,p,p + 4 * s,16,1,1,1,8,8,8);
+            pipe_barrier(PIPE_V);
+            vadd(p,other,other + 2 * s,8,1,1,1,8,8,8);
+            pipe_barrier(PIPE_V);
+            vadd(other,p,p + s,4,1,1,1,8,8,8);
+            pipe_barrier(PIPE_V);
+            columnSum=other;
+          } else {
+          vadd(p,p,p + 16 * s,64,1,1,1,8,8,8);
           pipe_barrier(PIPE_V);
-          vadd(p,other,other + 2 * s,8,1,1,1,8,8,8);
+          vadd(p,p,p + 8 * s,32,1,1,1,8,8,8);
           pipe_barrier(PIPE_V);
-          vadd(other,p,p + s,4,1,1,1,8,8,8);
+          vadd(p,p,p + 4 * s,16,1,1,1,8,8,8);
           pipe_barrier(PIPE_V);
-          columnSum=other;
+          vadd(p,p,p + 2 * s,8,1,1,1,8,8,8);
+          pipe_barrier(PIPE_V);
+          vadd(p,p,p + 1 * s,4,1,1,1,8,8,8);
+          pipe_barrier(PIPE_V);
+          }
         } else {
-        vadd(p,p,p + 16 * s,64,1,1,1,8,8,8);
-        pipe_barrier(PIPE_V);
-        vadd(p,p,p + 8 * s,32,1,1,1,8,8,8);
-        pipe_barrier(PIPE_V);
-        vadd(p,p,p + 4 * s,16,1,1,1,8,8,8);
-        pipe_barrier(PIPE_V);
-        vadd(p,p,p + 2 * s,8,1,1,1,8,8,8);
-        pipe_barrier(PIPE_V);
-        vadd(p,p,p + 1 * s,4,1,1,1,8,8,8);
-        pipe_barrier(PIPE_V);
+          U32 height=qr;
+          if (hf) {
+            vadd(p,b,b + half,half / lanes,1,1,1,8,8,8);
+            pipe_barrier(PIPE_V);
+            height=hr;
+          } else {
+            vadd(p,b,b + q,q / lanes,1,1,1,8,8,8);
+            pipe_barrier(PIPE_V);
+            vadd(p,p,b + 2 * q,q / lanes,1,1,1,8,8,8);
+            pipe_barrier(PIPE_V);
+            vadd(p,p,b + 3 * q,q / lanes,1,1,1,8,8,8);
+            pipe_barrier(PIPE_V);
+          }
+          for (; height > 1; height /= 2) {
+            vadd(p,p,p + height / 2 * s,
+                 height / 2 * s / lanes,1,1,1,8,8,8);
+            pipe_barrier(PIPE_V);
+          }
         }
-      } else {
-        U32 height=qr;
-        if (hf) {
-          vadd(p,b,b + half,half / lanes,1,1,1,8,8,8);
-          pipe_barrier(PIPE_V);
-          height=hr;
-        } else {
-          vadd(p,b,b + q,q / lanes,1,1,1,8,8,8);
-          pipe_barrier(PIPE_V);
-          vadd(p,p,b + 2 * q,q / lanes,1,1,1,8,8,8);
-          pipe_barrier(PIPE_V);
-          vadd(p,p,b + 3 * q,q / lanes,1,1,1,8,8,8);
-          pipe_barrier(PIPE_V);
-        }
-        for (; height > 1; height /= 2) {
-          vadd(p,p,p + height / 2 * s,
-               height / 2 * s / lanes,1,1,1,8,8,8);
-          pipe_barrier(PIPE_V);
-        }
+        vadds(d,columnSum,eps,nv,1,1,8,8);
+        pipe_barrier(PIPE_V);
       }
-      vadds(d,columnSum,eps,nv,1,1,8,8);
-      pipe_barrier(PIPE_V);
       if constexpr (P) {
         // Contiguous tokens in the interleaved row a share one relative
         // coefficient phase. Write the division r in its final location.
         const U32 phase =
             ((reinterpret_cast<U64>(b) ^
               reinterpret_cast<U64>(p)) & 256u) ? 0 : 64;
-        vdiv(p + phase,u,d,nv,1,1,1,8,8,8);
-        pipe_barrier(PIPE_V);
+        if (predict) {
+          pipe_barrier(PIPE_V);
+          PredictFactors(p+phase,history+2*nr,w,nr,nv,round);
+        } else {
+          vdiv(p+phase,u,d,nv,1,1,1,8,8,8);
+          pipe_barrier(PIPE_V);
+          if (capture) CopyFactors(history+(2+round%2)*nr,p+phase,nv);
+        }
         for (U32 token=0; token < 4; ++token)
           vmul(a + token * 4096,b + token * 64,
                p + phase + token * 64,
@@ -233,13 +273,19 @@ class Medium64 {
     U32 pad=0;
     U32 reserve=0;
     const U32 ss=13 * s * sizeof(float) + 256;
-    if (t_.scratch_bytes == ss + t_.matrix_bytes + 512)
+    const U32 alternate=ss+t_.matrix_bytes+512;
+    historyReady_=t_.tile_tokens==4 &&
+        t_.scratch_bytes==alternate+kAlignedMediumFactorHistoryBytes;
+    alternateReady_=t_.scratch_bytes==alternate || historyReady_;
+    if (alternateReady_)
       reserve=t_.matrix_bytes + 512;
     if (t_.scratch_bytes == ss || reserve)
       pad=256;
 
     pipe_.InitBuffer(denBuf_,s * sizeof(float) + pad +
                                        reserve);
+    if (historyReady_)
+      pipe_.InitBuffer(historyBuf_,kAlignedMediumFactorHistoryBytes);
 
     a_=matBuf_.Get<float>();
     g_=gateBuf_.Get<float>();
@@ -267,14 +313,13 @@ class Medium64 {
       const bool more=(offset + t_.tile_tokens < count_);
 
       pk_=valid_ == 4 && t_.input_bytes >= 32768 &&
-          t_.scratch_bytes == 13 * t_.h_pad * t_.tile_tokens * sizeof(float) +
-                              256 + t_.matrix_bytes + 512;
+          alternateReady_;
       Input(start_ + offset,prev,more);
 
       bool useAlignedAlternate=false;
       const U32 capacitySpan=t_.h_pad * t_.tile_tokens;
       const U32 ss=13 * capacitySpan * sizeof(float) + 256;
-      if (t_.scratch_bytes == ss + t_.matrix_bytes + 512) {
+      if (alternateReady_) {
         useAlignedAlternate=(span_ * sizeof(float)) % 512 == 0;
         d_=denBuf_.Get<float>();
         if (!useAlignedAlternate) d_=d_[256 / sizeof(float)];
@@ -298,7 +343,8 @@ class Medium64 {
           reinterpret_cast<UBFloat *>(u_.GetPhyAddr()),
           reinterpret_cast<UBFloat *>(d_.GetPhyAddr()),
           valid_,t_.input_bytes / sizeof(float),
-          t_.tile_tokens % 2 == 0 ? 64U : 0U,t_.eps,t_.iters);
+          t_.tile_tokens % 2 == 0 ? 64U : 0U,t_.eps,t_.iters,
+          historyReady_?reinterpret_cast<UBFloat *>(historyBuf_.Get<float>().GetPhyAddr()):nullptr);
       } else {
       Rounds64<false>(
           reinterpret_cast<UBFloat *>(a_.GetPhyAddr()),b,
@@ -409,13 +455,13 @@ class Medium64 {
   TPipe pipe_;
   TBuf<TPosition::VECOUT> matBuf_,gateBuf_;
   TBuf<TPosition::VECCALC> sumBuf_,tmpBuf_,resBuf_,
-      oneBuf_,denBuf_;
+      oneBuf_,denBuf_,historyBuf_;
   LocalTensor<float> a_,g_,p_,w_,r_,u_,d_;
   GlobalTensor<float> input_,pre_,post_,comb_;
   sinkhorn_norm::TilingData t_;
   U64 start_,count_,sm_[2];
   U32 valid_,rows_,span_;
-  bool pk_;
+  bool pk_,historyReady_,alternateReady_;
 };
 
 }  // namespace f11

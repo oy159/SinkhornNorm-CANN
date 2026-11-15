@@ -207,7 +207,7 @@ __aicore__ __attribute__((always_inline)) inline void RunBlockedFactors(
     __ubuf__ float *k,__ubuf__ float *scratch,__ubuf__ float *sum,
     __ubuf__ float *a,__ubuf__ float *b,__ubuf__ float *ones,
     __ubuf__ float *coeffZero,__ubuf__ float *coeffHalf,
-    uint32_t h,uint32_t pitch,float eps,uint32_t rounds) {
+    uint32_t h,uint32_t pitch,float eps,uint32_t rounds,bool seededColumn=false,uint32_t outputTokens=0) {
   if ASCEND_IS_AIV {
     const uint32_t rows=8*h,plane=64*h,blocks=pitch / 8;
     const uint32_t span=64*blocks;
@@ -218,7 +218,9 @@ __aicore__ __attribute__((always_inline)) inline void RunBlockedFactors(
     SetMaskNorm();
     SetVectorMask<float,MaskMode::NORMAL>(0,~uint64_t{0});
     vector_dup(a,1.0f,(rows+63) / 64,1,1,8,0);
-    vector_dup(b,1.0f,blocks,1,1,8,0);
+    if (seededColumn)
+      vcopy(reinterpret_cast<__ubuf__ uint32_t *>(b),reinterpret_cast<__ubuf__ uint32_t *>(sum),blocks,1,1,8,8);
+    else vector_dup(b,1.0f,blocks,1,1,8,0);
     vector_dup(vbase,0.0f,2*blocks,1,1,8,0);
     pipe_barrier(PIPE_V);
     const uint32_t width=h - (blocks - 1)*8;
@@ -268,24 +270,24 @@ __aicore__ __attribute__((always_inline)) inline void RunBlockedFactors(
       }
       pipe_barrier(PIPE_V);
       SetVectorMask<float,MaskMode::NORMAL>(0,~uint64_t{0});
-      for (uint32_t row=0; row < h; row += 8) {
-        const uint32_t n=h - row < 8 ? h - row : 8;
+      // Four independent row accumulators per plane leave one less
+      // tree level before the packed denominator.
+      for (uint32_t row=0; row < h; row += 4) {
+        const uint32_t n=h - row < 4 ? h - row : 4;
         for (uint32_t q=0; q < blocks; ++q) {
           auto m=k+q*plane;
           auto coeff=(reinterpret_cast<uint64_t>(m) & 256u) ? coeffZero : coeffHalf;
-          if (row == 0) vmul(acc+q*512,m,coeff,n,1,1,1,8,8,8);
-          else vmla(acc+q*512,m+row*64,coeff+row*64,n,1,1,1,8,8,8);
+          if (row == 0) vmul(acc+q*256,m,coeff,n,1,1,1,8,8,8);
+          else vmla(acc+q*256,m+row*64,coeff+row*64,n,1,1,1,8,8,8);
         }
       }
       pipe_barrier(PIPE_V);
-      for (uint32_t half=4; half != 0; half /= 2) {
-        for (uint32_t q=0; q < blocks; ++q) {
-          auto c=acc+q*512;
-          vadd(c,c,c+half*64,half,1,1,1,8,8,8);
-        }
-        pipe_barrier(PIPE_V);
+      for (uint32_t q=0; q < blocks; ++q) {
+        auto c=acc+q*256;
+        vadd(c,c,c+128,2,1,1,1,8,8,8);
       }
-      vcopy(reinterpret_cast<__ubuf__ uint32_t *>(sum),reinterpret_cast<__ubuf__ uint32_t *>(acc),blocks,1,1,8,64);
+      pipe_barrier(PIPE_V);
+      vadd(sum,acc,acc+64,blocks,1,1,1,8,32,32);
       pipe_barrier(PIPE_V);
       vaxpy(sum,b,eps,blocks,1,1,8,8);
       pipe_barrier(PIPE_V);
@@ -302,16 +304,22 @@ __aicore__ __attribute__((always_inline)) inline void RunBlockedFactors(
     }
     pipe_barrier(PIPE_V);
     SetVectorMask<float,MaskMode::NORMAL>(0,~uint64_t{0});
+    if (outputTokens)
+      SetVectorMask<float,MaskMode::NORMAL>(0,outputTokens==8?~uint64_t{0}:(uint64_t{1}<<(8*outputTokens))-1);
     for (uint32_t q=0; q < blocks; ++q) {
       auto m=k+q*plane;
       auto coeff=(reinterpret_cast<uint64_t>(m) & 256u) ? coeffZero : coeffHalf;
-      vmul(m,m,coeff,h,1,1,1,8,8,8);
+      if (outputTokens)
+        vmul(scratch+q*8,m,coeff,h,blocks,1,1,outputTokens*blocks,8,8);
+      else vmul(m,m,coeff,h,1,1,1,8,8,8);
     }
     pipe_barrier(PIPE_V);
     for (uint32_t q=0; q < blocks; ++q) {
       auto m=k+q*plane;
       auto v=vbase+q*128+((reinterpret_cast<uint64_t>(m) & 256u) ? 0 : 64);
-      vmul(m,m,v,h,1,1,1,8,8,0);
+      if (outputTokens)
+        vmul(scratch+q*8,scratch+q*8,v,h,blocks,blocks,1,outputTokens*blocks,outputTokens*blocks,0);
+      else vmul(m,m,v,h,1,1,1,8,8,0);
     }
     pipe_barrier(PIPE_V);
   }
@@ -319,7 +327,7 @@ __aicore__ __attribute__((always_inline)) inline void RunBlockedFactors(
 
 // Reuse the retired dense staging/index arrays for blocked matrix storage and
 // phased row coefficients. GM packing,the first round and total UB stay fixed.
-template <bool FullVectors=false,bool Factors=false>
+template <bool FullVectors=false,bool Factors=false,bool DeferredColumn=false>
 __aicore__ __attribute__((always_inline)) inline void RunMediumBlockedRounds(
     __ubuf__ float *original,__ubuf__ float *blocked,__ubuf__ float *partial,
     __ubuf__ float *result,__ubuf__ float *ones,__ubuf__ float *denom,
@@ -367,8 +375,20 @@ __aicore__ __attribute__((always_inline)) inline void RunMediumBlockedRounds(
     auto coeffZero=coeffStorage+prefix;
     auto coeffHalf=coeffZero+plane+(plane % 128 == 0 ? 64 : 0);
     if constexpr (Factors) {
+      if constexpr (DeferredColumn) {
+        // The first column normalization is represented by b rather than
+        // written into K. Repack its real denominators before partial reuse.
+        SetVectorMask<float,MaskMode::NORMAL>(0,~uint64_t{0});
+        vector_dup(partial,1.0f,blocks,1,1,8,0);
+        pipe_barrier(PIPE_V);
+        SetVectorMask<float,MaskMode::NORMAL>(0,valid==8?~uint64_t{0}:(uint64_t{1}<<(8*valid))-1);
+        for (uint32_t q=0;q<blocks;++q)
+          vcopy(reinterpret_cast<__ubuf__ uint32_t *>(partial+q*64),
+                reinterpret_cast<__ubuf__ uint32_t *>(denom+q*8),1,1,blocks,8,pitch);
+        pipe_barrier(PIPE_V);
+      }
       RunBlockedFactors(blocked,original,partial,result,denom,ones,
-                        coeffZero,coeffHalf,h,pitch,eps,rounds);
+                        coeffZero,coeffHalf,h,pitch,eps,rounds,DeferredColumn,FullVectors?valid:0);
     } else {
     for (uint32_t round=0; round < rounds; ++round) {
       SetVectorMask<float,MaskMode::NORMAL>(0,~uint64_t{0});
@@ -455,6 +475,11 @@ __aicore__ __attribute__((always_inline)) inline void RunMediumBlockedRounds(
       }
       pipe_barrier(PIPE_V);
     }
+    }
+    if constexpr (FullVectors && Factors) {
+      SetMaskNorm();
+      ResetMask();
+      return;
     }
     SetVectorMask<float,MaskMode::NORMAL>(0,~uint64_t{0});
     if constexpr (FullVectors) {
@@ -556,7 +581,14 @@ class MediumDenseIoKernel {
       rows_=paddedRows;
       Gates();
       Softmax();
-      Columns();
+      const uint32_t paddedMatrix=t_.h*8*t_.h_pad;
+      const uint32_t paddedCoefficients=16*t_.h*8+512+128*(t_.h_pad/8);
+      const bool useFactors=paddedBlocked_ && valid_*8>=48 && valid_<=8 &&
+          t_.eps>=0x1p-40f && t_.eps<=1.0f &&
+          paddedMatrix+paddedCoefficients<=2*medium_stage_capacity_ &&
+          ((t_.h+1)/2)*8*t_.h_pad*sizeof(float)<=t_.matrix_bytes;
+      if (useFactors) Columns<false>();
+      else Columns<true>();
       auto alternate=matrix_;
       const uint32_t rowCount=(t_.h*valid_+7) / 8*8;
       if (rowCount*t_.h_pad <= medium_stage_capacity_) {
@@ -567,14 +599,9 @@ class MediumDenseIoKernel {
           PipeBarrier<PIPE_V>();
         }
       }
-      const uint32_t paddedMatrix=t_.h*8*t_.h_pad;
-      const uint32_t paddedCoefficients=16*t_.h*8+512+128*(t_.h_pad / 8);
-      if (paddedBlocked_ && valid_*8 >= 48 && valid_ <= 8 &&
-          t_.eps >= 0x1p-40f && t_.eps <= 1.0f &&
-          paddedMatrix+paddedCoefficients <= 2*medium_stage_capacity_ &&
-          ((t_.h+1) / 2)*8*t_.h_pad*sizeof(float) <= t_.matrix_bytes) {
+      if (useFactors) {
         auto pool=reinterpret_cast<__ubuf__ float *>(medium_stage_.GetPhyAddr());
-        RunMediumBlockedRounds<true,true>(
+        RunMediumBlockedRounds<true,true,true>(
             reinterpret_cast<__ubuf__ float *>(matrix_.GetPhyAddr()),pool,
             reinterpret_cast<__ubuf__ float *>(partial_.GetPhyAddr()),
             reinterpret_cast<__ubuf__ float *>(result_.GetPhyAddr()),
@@ -660,12 +687,13 @@ class MediumDenseIoKernel {
 
   __aicore__ inline void Gates() {
     const uint32_t n=2*span_;
-    auto numerator=tmp_[n];
+    auto numerator=ones_;
     auto denominator=tmp_[2*n];
-    Duplicate(numerator,1.0f,n);
     Muls(tmp_,gates_,-1.0f,n);
     Mins(tmp_,tmp_,80.0f,n);
     Exp(tmp_,tmp_,n);
+    // Independent row maxima can execute while the gate exponential settles.
+    GroupedRowMaxReduce();
     Adds(denominator,tmp_,1.0f,n);
     Div(gates_,numerator,denominator,n);
     Adds(gates_,gates_,t_.eps,span_);
@@ -756,7 +784,7 @@ class MediumDenseIoKernel {
   }
 
   __aicore__ inline void Softmax() {
-    GroupedRowMaxReduce();
+    // Gates prepared the row maxima before consuming its exponential.
     BroadcastRows();
     ApplyRows<true>();
     Exp(matrix_,matrix_,rows_*t_.h_pad);
@@ -770,6 +798,7 @@ class MediumDenseIoKernel {
     PipeBarrier<PIPE_V>();
   }
 
+  template <bool Materialize=true>
   __aicore__ inline void Columns() {
     uint32_t rows=(t_.h+3) / 4;
     Add(partial_,matrix_,matrix_[rows*span_],rows*span_);
@@ -797,6 +826,7 @@ class MediumDenseIoKernel {
     PipeBarrier<PIPE_V>();
     Adds(denom_,denom_,t_.eps,span_);
     PipeBarrier<PIPE_V>();
+    if constexpr (!Materialize) return;
     Div(denom_,ones_,denom_,span_);
     PipeBarrier<PIPE_V>();
     for (uint32_t col=0; col < span_; col += 64) {
@@ -927,7 +957,7 @@ class MediumDenseIoKernel {
 }  // namespace sinkhorn_f09
 
 template <int=0>
-__global__ __aicore__ __attribute__((aligned(64))) void sinkhorn_f09_kernel(
+__global__ __aicore__ __attribute__((aligned(1024))) void sinkhorn_f09_kernel(
     GM_ADDR mixes,GM_ADDR pre,GM_ADDR post,GM_ADDR comb,
     sinkhorn_norm::TilingData tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);

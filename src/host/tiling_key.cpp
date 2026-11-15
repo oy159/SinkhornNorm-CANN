@@ -86,6 +86,13 @@ TilingKey SelectTilingKey(std::uint32_t blocks, const TilingData &tiling,
     return KeyOf(KernelFamily::F05_NarrowP16ShortBatch, 0);
   }
 
+  if (UsesLongNarrowPlanes(tiling)) {
+    const bool useFactors =
+        tiling.iters >= 12 && tiling.eps >= 0x1p-24f && tiling.eps <= 0x1p-8f;
+    return KeyOf(KernelFamily::F07_NarrowP16DenseIo,
+                 useFactors ? kNarrowDenseFactorVariant : 0);
+  }
+
   // [p7] F06_NarrowP16PairedRows: H in [9, 16], iter >= 4
   if (tiling.h <= 16 && tiling.iters >= 4 &&
       UsesGroupedNarrowRound(blocks, tiling)) {
@@ -95,7 +102,7 @@ TilingKey SelectTilingKey(std::uint32_t blocks, const TilingData &tiling,
   // --- Step 3 Batch 3B: Hidden Benchmark Regimes (p8) ---
   // [p8] F07_NarrowP16DenseIo: H in [9, 16), iters in [2, 3], dense multi-tile IO
   if (UsesDenseNarrowIo(tiling)) {
-    return KeyOf(KernelFamily::F07_NarrowP16DenseIo, 0);
+    return KeyOf(KernelFamily::F07_NarrowP16DenseIo, 4 * tiling.h + tiling.iters);
   }
 
   // --- General Fallback (F00_GeneralFallback) ---

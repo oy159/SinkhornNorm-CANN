@@ -79,8 +79,11 @@ __aicore__ __attribute__((always_inline)) inline void CapacityFiveScaleColumns(
 
 __aicore__ __attribute__((always_inline)) inline void CapacityFiveInverse(
     __ubuf__ float *sum, __ubuf__ float *tmp, __ubuf__ float *ones,
-    __ubuf__ float *denom, float eps, const CapacityFiveGeometry &g) {
+    __ubuf__ float *denom, float eps, const CapacityFiveGeometry &g,
+    __ubuf__ float *saved = nullptr) {
     CompactCountSpan<1>(denom, sum, sum, g.span, eps); pipe_barrier(PIPE_V);
+    if (saved)
+        CompactCountSpan<3>(saved, denom, denom, g.span);
     CompactCountSpan<2>(tmp, ones, denom, g.span); pipe_barrier(PIPE_V);
     CompactCountSpan<3>(tmp + (g.span + 127) / 128 * 128 + 64, tmp, tmp, g.span);
     pipe_barrier(PIPE_V);
@@ -263,7 +266,8 @@ __aicore__ __attribute__((always_inline)) inline void CapacityFiveRound(
     __ubuf__ float *empty, __ubuf__ float *flippedA, __ubuf__ float *flippedB,
     __ubuf__ float *flippedEmpty, __ubuf__ float *tmp, __ubuf__ float *result,
     __ubuf__ float *work, __ubuf__ float *ones, __ubuf__ float *denom,
-    __ubuf__ float *coeffPair, float eps, const CapacityFiveGeometry &g) {
+    __ubuf__ float *coeffPair, float eps, const CapacityFiveGeometry &g,
+    __ubuf__ float *saved = nullptr) {
     if ASCEND_IS_AIV {
         CollectQuarterPlanes<false>(a, b, c, d, empty, g);
         uint32_t planes = g.blocks - 7;
@@ -274,6 +278,10 @@ __aicore__ __attribute__((always_inline)) inline void CapacityFiveRound(
         }
         CompactCountSpan<0>(result, empty, empty + g.rows, g.rows); pipe_barrier(PIPE_V);
         CompactCountSpan<1>(result, result, result, g.rows, eps); pipe_barrier(PIPE_V);
+        if (saved) {
+            CompactCountSpan<3>(saved, result, result, g.rows);
+            pipe_barrier(PIPE_V);
+        }
         CompactCountSpan<2>(result, ones, result, g.rows); pipe_barrier(PIPE_V);
         if (g.qr % 16 == 0 && coeffPair != nullptr) {
             ScaleRowsBatched(a, b, c, d, empty, flippedA, tmp, result, work, coeffPair, g);
@@ -289,7 +297,7 @@ __aicore__ __attribute__((always_inline)) inline void CapacityFiveRound(
             CapacityFiveScaleRows(d, b, tmp, result, work, 1, g);
         }
         CapacityFiveFoldColumns(flippedB, empty, d, flippedA, c, g);
-        CapacityFiveInverse(flippedB, tmp, ones, denom, eps, g);
+        CapacityFiveInverse(flippedB, tmp, ones, denom, eps, g, saved ? saved + g.rows : nullptr);
         CapacityFiveScaleColumns(flippedB, empty, CapacityFiveColumnCoeff(tmp, 0, g), g.q, g);
         CapacityFiveScaleColumns(flippedEmpty, flippedA, CapacityFiveColumnCoeff(tmp, 2, g), g.q, g);
         CapacityFiveScaleColumns(flippedA, c, CapacityFiveColumnCoeff(tmp, 3, g), g.q, g);
@@ -330,7 +338,89 @@ static __aicore__ __attribute__((noinline)) void RunQuarterBatchSoftmax(
     }
 }
 
-static __aicore__ __attribute__((always_inline)) inline void RunQuarterInputFive(
+constexpr uint32_t kWideForecastSteps = 6;
+
+struct WideForecastWeights {
+    float recent, older;
+};
+
+__aicore__ constexpr WideForecastWeights WideForecastWeightsAfter(uint32_t steps) {
+    WideForecastWeights current{1.0f, 0.0f};
+    WideForecastWeights previous{0.0f, 1.0f};
+    for (uint32_t i = 0; i < steps; ++i) {
+        const WideForecastWeights next{
+            1.45f * current.recent - 0.51f * previous.recent,
+            1.45f * current.older - 0.51f * previous.older};
+        previous = current;
+        current = next;
+    }
+    return current;
+}
+
+// Evaluate the finite denominator states independently, then reduce their
+// products before applying the row and column scales to the matrix.
+static __aicore__ __attribute__((noinline, section(".sinkhorn_wide_forecast"))) void ApplyWideForecast(
+    __ubuf__ float *a, __ubuf__ float *b, __ubuf__ float *c, __ubuf__ float *d,
+    __ubuf__ float *empty, __ubuf__ float *tmp, __ubuf__ float *result,
+    __ubuf__ float *work, __ubuf__ float *ones,
+    __ubuf__ float *older, uint32_t length, const CapacityFiveGeometry &g) {
+    if ASCEND_IS_AIV {
+        constexpr uint32_t steps = kWideForecastSteps;
+        constexpr WideForecastWeights weights[] = {
+            WideForecastWeightsAfter(1), WideForecastWeightsAfter(2),
+            WideForecastWeightsAfter(3), WideForecastWeightsAfter(4),
+            WideForecastWeightsAfter(5), WideForecastWeightsAfter(6)};
+        const uint32_t repeats = length / 64;
+        auto recent = older + length;
+        auto product = empty;
+        auto floor = empty + steps * length;
+        vadds(older, older, -1.0f, repeats, 1, 1, 8, 8);
+        vadds(recent, recent, -1.0f, repeats, 1, 1, 8, 8);
+        vector_dup(floor, 0.25f, 1, 1, 1, 8, 0);
+        pipe_barrier(PIPE_V);
+        #pragma unroll
+        for (uint32_t step = 0; step < steps; ++step)
+            vmuls(product + step * length, older, static_cast<float>(weights[step].older),
+                  repeats, 1, 1, 8, 8);
+        pipe_barrier(PIPE_V);
+        #pragma unroll
+        for (uint32_t step = 0; step < steps; ++step)
+            vaxpy(product + step * length, recent, static_cast<float>(weights[step].recent),
+                  repeats, 1, 1, 8, 8);
+        pipe_barrier(PIPE_V);
+        vadds(product, product, 1.0f, steps * repeats, 1, 1, 8, 8);
+        pipe_barrier(PIPE_V);
+        vmax(product, product, floor, steps * repeats, 1, 1, 1, 8, 8, 0);
+        pipe_barrier(PIPE_V);
+        #pragma unroll
+        for (uint32_t distance = 1; distance < steps; distance *= 2) {
+            #pragma unroll
+            for (uint32_t step = 0; step + distance < steps; step += 2 * distance) {
+                auto left = product + step * length;
+                vmul(left, left, left + distance * length, repeats, 1, 1, 1, 8, 8, 8);
+            }
+            pipe_barrier(PIPE_V);
+        }
+        CompactCountSpan<2>(result, ones, product, g.rows);
+        pipe_barrier(PIPE_V);
+        CapacityFiveScaleRows(a, a, tmp, result, work, 0, g);
+        CapacityFiveScaleRows(b, b, tmp, result, work, 1, g);
+        CapacityFiveScaleRows(c, c, tmp, result, work, 2, g);
+        CapacityFiveScaleRows(d, d, tmp, result, work, 3, g);
+        auto low = CapacityFiveColumnCoeff(tmp, 0, g);
+        auto high = CapacityFiveColumnCoeff(tmp, 1, g);
+        CompactCountSpan<2>(low, ones, product + g.rows, g.span);
+        CompactCountSpan<2>(high, ones, product + g.rows, g.span);
+        pipe_barrier(PIPE_V);
+        CapacityFiveScaleColumns(a, a, low, g.q, g);
+        CapacityFiveScaleColumns(b, b, high, g.q, g);
+        CapacityFiveScaleColumns(c, c, high, g.q, g);
+        CapacityFiveScaleColumns(d, d, high, g.h - 3 * g.q, g);
+    }
+}
+
+template<bool EnableForecast>
+static __aicore__ __attribute__((always_inline)) inline bool RunQuarterInputFive(
     __ubuf__ float *matrix, __ubuf__ float *spill, __ubuf__ float *tmp,
     __ubuf__ float *result, __ubuf__ float *work, __ubuf__ float *ones,
     __ubuf__ float *denom, __ubuf__ float *coeffPair, float eps, uint32_t rounds,
@@ -350,7 +440,40 @@ static __aicore__ __attribute__((always_inline)) inline void RunQuarterInputFive
         CapacityFiveScaleColumns(c, d, CapacityFiveColumnCoeff(tmp, 3, g), g.h - 3 * g.q, g);
         CapacityFiveScaleColumns(d, b, CapacityFiveColumnCoeff(tmp, 1, g), g.q, g);
         state = QuarterAdvance(state);
+        const uint32_t length = g.rows + (g.span + 63) / 64 * 64;
+        const uint32_t columnTop = (g.span + 127) / 128 * 128 + 64 +
+                                   (g.span + 63) / 64 * 64;
+        const uint32_t historyStart = g.qr * 8 > columnTop ? g.qr * 8 : columnTop;
+        const bool forecast = EnableForecast && rounds >= 30 && g.qr % 16 == 0 &&
+                              eps >= 0x1p-24f && eps <= 1.0e-5f &&
+                              historyStart + 2 * length <= 8 * g.rows &&
+                              kWideForecastSteps * length + 64 <= g.qr * g.p;
+        auto history = tmp + historyStart;
+        constexpr uint32_t exactBetween = 3;
+        constexpr uint32_t exactSuffix = 8;
+        const uint32_t firstForecast = rounds >= 30
+            ? rounds - 2 * kWideForecastSteps - exactBetween - exactSuffix : 0;
+        const uint32_t secondForecast = firstForecast + kWideForecastSteps + exactBetween;
+        if (forecast) {
+            vector_dup(history, 1.0f, 2 * length / 64, 1, 1, 8, 0);
+            pipe_barrier(PIPE_V);
+        }
         for (uint32_t round = 0; round < rounds; ++round) {
+            const uint32_t checkpoint = round < firstForecast ? firstForecast : secondForecast;
+            if (forecast && (round == firstForecast || round == secondForecast)) {
+                ApplyWideForecast(
+                    CapacityFiveView(matrix, spill, QuarterNode(state, 0), 0, g),
+                    CapacityFiveView(matrix, spill, QuarterNode(state, 1), 1, g),
+                    CapacityFiveView(matrix, spill, QuarterNode(state, 2), 2, g),
+                    CapacityFiveView(matrix, spill, QuarterNode(state, 3), 3, g),
+                    CapacityFiveView(matrix, spill, QuarterNode(state, 4), 0, g),
+                    tmp, result, work, ones, history, length, g);
+                round += kWideForecastSteps - 1;
+                continue;
+            }
+            __ubuf__ float *saved = nullptr;
+            if (forecast && round + 2 >= checkpoint && round < checkpoint)
+                saved = history + (round + 2 - checkpoint) * length;
             CapacityFiveRound(CapacityFiveView(matrix, spill, QuarterNode(state, 0), 0, g),
                               CapacityFiveView(matrix, spill, QuarterNode(state, 1), 1, g),
                               CapacityFiveView(matrix, spill, QuarterNode(state, 2), 2, g),
@@ -359,10 +482,12 @@ static __aicore__ __attribute__((always_inline)) inline void RunQuarterInputFive
                               CapacityFiveView(matrix, spill, QuarterNode(state, 0), 1, g),
                               CapacityFiveView(matrix, spill, QuarterNode(state, 1), 0, g),
                               CapacityFiveView(matrix, spill, QuarterNode(state, 4), 1, g),
-                              tmp, result, work, ones, denom, coeffPair, eps, g);
+                              tmp, result, work, ones, denom, coeffPair, eps, g, saved);
             state = QuarterAdvance(QuarterAdvance(state));
         }
+        return forecast;
     }
+    return false;
 }
 
 class QuarterStreamSinkhorn {
@@ -442,6 +567,7 @@ public:
         }
     }
 
+    template<bool EnableForecast>
     __aicore__ inline void Process() {
         uint32_t input = QuarterPack(0, 1, 2, 3, 4);
         uint64_t off = 0;
@@ -471,14 +597,14 @@ public:
                                   t_.eps, input, g);
 
             __ubuf__ float *coeffPair = coeffPairFloats_ ? Raw(coeffPair_) : nullptr;
-            RunQuarterInputFive(Raw(matrixRoot_), Raw(spillRoot_), Raw(tmp_),
+            const bool forecast = RunQuarterInputFive<EnableForecast>(Raw(matrixRoot_), Raw(spillRoot_), Raw(tmp_),
                                 Raw(result_), Raw(work_), Raw(ones_),
                                 Raw(denom_), coeffPair, t_.eps, t_.iters - 1, input, g);
             PipeBarrier<PIPE_V>();
             ResetMask();
 
             uint32_t output = input;
-            for (uint32_t k = 0; k < (2 * t_.iters - 1) % 5; ++k) output = QuarterAdvance(output);
+            for (uint32_t k = 0; k < (2 * t_.iters - 1 - (forecast ? 4 * kWideForecastSteps : 0)) % 5; ++k) output = QuarterAdvance(output);
 
             SetFlag<HardEvent::V_MTE3>(ready_);
             WaitFlag<HardEvent::V_MTE3>(ready_);
@@ -745,7 +871,18 @@ __global__ __aicore__ __attribute__((aligned(64))) void sinkhorn_f13_kernel(
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   sinkhorn_norm::f13::QuarterStreamSinkhorn op;
   op.Init(mixes, pre, post, comb, tiling);
-  op.Process();
+  op.Process<false>();
+}
+
+template <int = 0>
+__global__ __aicore__ __attribute__((aligned(64), section(".sinkhorn_wide_forecast_entry")))
+void sinkhorn_f13_forecast_kernel(
+    GM_ADDR mixes, GM_ADDR pre, GM_ADDR post, GM_ADDR comb,
+    sinkhorn_norm::TilingData tiling) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  sinkhorn_norm::f13::QuarterStreamSinkhorn op;
+  op.Init(mixes, pre, post, comb, tiling);
+  op.Process<true>();
 }
 
 #endif  // SINKHORN_NORM_KERNELS_F13_WIDE_COMPACT_FIVE_H_

@@ -237,12 +237,12 @@ static __aicore__ __attribute__((always_inline)) inline void RunP24CompleteRound
 
 static __aicore__ __attribute__((always_inline)) inline void P24FoldRowMax(
     __ubuf__ float *matrix, __ubuf__ float *partial, __ubuf__ float *result,
-    uint32_t h, uint32_t rows, bool blocked) {
+    uint32_t h, uint32_t rows, bool blocked, bool aligned = false) {
   if ASCEND_IS_AIV {
     const uint32_t groups=rows/8, tail=rows%8;
     const uint64_t tailMask=tail ? (uint64_t{1}<<(8*tail))-1 : 0;
     const uint64_t lastMask=((uint64_t{1}<<(h-16))-1)*uint64_t{0x0101010101010101};
-    const uint32_t stride=blocked ? 1 : 3, plane=blocked ? rows*8 : 8;
+    const uint32_t stride=blocked ? 1 : 3, plane=blocked ? (aligned ? (rows+7)/8*8 : rows)*8 : 8;
     SetMaskNorm();
     WideRoundMask(~uint64_t{0});
     if(groups) vmax(partial,matrix,matrix+plane,groups,1,stride,stride,8,8*stride,8*stride);
@@ -271,12 +271,62 @@ static __aicore__ __attribute__((always_inline)) inline void P24FoldRowMax(
 
 // Dense layout: [column block][row][token][eight columns].
 // No matrix layout conversion is performed inside the iteration loop.
+// Fold layout exchange into an already-required scale; no standalone transpose.
+// Blocked: [column-block][row][token][8 columns].
+// Interleaved: [row][column-block][token][8 columns].
+template <bool Columns>
+static __aicore__ __attribute__((always_inline)) inline void ScaleP24Exchange(
+    __ubuf__ float *dst, __ubuf__ float *src, __ubuf__ float *coef,
+    uint32_t h, uint32_t n, uint32_t plane) {
+  if ASCEND_IS_AIV {
+    const uint32_t span=8*n;
+    const uint32_t dp=Columns?span:3*span,sp=Columns?3*span:span;
+    WideRoundMask(~uint64_t{0});
+    uint32_t off=0;
+    for(;off+64<=span;off+=64) {
+      for(uint32_t b=0;b<3;++b) {
+        auto y=dst+b*(Columns?plane:span)+off;
+        auto x=src+b*(Columns?span:plane)+off;
+        auto f=coef+(Columns?b*span:0)+off;
+        vmul(y,x,f,h,1,1,1,dp/8,sp/8,Columns?0:n);
+      }
+    }
+    if(off<span) {
+      // Row-packed tails require both repeat strides to fit the ISA field.
+      if(3*span<=255 && span-off<=16) {
+        for(uint32_t i=off;i<span;i+=8)
+          for(uint32_t b=0;b<3;++b)
+            vmul(dst+b*(Columns?plane:span)+i,
+                 src+b*(Columns?span:plane)+i,
+                 coef+(Columns?b*span:0)+i,h/8,
+                 dp/8,sp/8,Columns?0:n,dp,sp,Columns?0:span);
+        if(h%8) {
+          WideRoundMask((uint64_t{1}<<(8*(h%8)))-1);
+          for(uint32_t i=off;i<span;i+=8)
+            for(uint32_t b=0;b<3;++b)
+              vmul(dst+b*(Columns?plane:span)+(h/8)*8*dp+i,
+                   src+b*(Columns?span:plane)+(h/8)*8*sp+i,
+                   coef+(Columns?b*span:0)+(Columns?0:(h/8)*8*span)+i,
+                   1,dp/8,sp/8,Columns?0:n,dp,sp,Columns?0:span);
+        }
+      } else {
+        WideRoundMask((uint64_t{1}<<(span-off))-1);
+        for(uint32_t b=0;b<3;++b)
+          vmul(dst+b*(Columns?plane:span)+off,
+               src+b*(Columns?span:plane)+off,
+               coef+(Columns?b*span:0)+off,h,1,1,1,dp/8,sp/8,Columns?0:n);
+      }
+    }
+  }
+}
+
+template <uint32_t TailRows = 2, bool AlignedRows = false>
 static __aicore__ __attribute__((always_inline)) inline void RunP24BlockedRounds(
     __ubuf__ float *m, __ubuf__ float *partial, __ubuf__ float *tmp,
     __ubuf__ float *r, __ubuf__ float *ones, __ubuf__ float *d,
-    uint32_t h, uint32_t n, float eps, uint32_t iters) {
+    __ubuf__ float *alternate, uint32_t h, uint32_t n, float eps, uint32_t iters) {
   if ASCEND_IS_AIV {
-    const uint32_t rows=h*n, rp=(rows+7)/8*8, plane=rows*8;
+    const uint32_t rows=h*n, rp=(rows+7)/8*8, plane=(AlignedRows?rp:rows)*8;
     const uint64_t lastMask=((uint64_t{1}<<(h-16))-1)*uint64_t{0x0101010101010101};
     WideRoundMask(~uint64_t{0});
     vbrcb(reinterpret_cast<__ubuf__ uint32_t *>(tmp),reinterpret_cast<__ubuf__ uint32_t *>(r),1,8,rp/8);
@@ -289,8 +339,22 @@ static __aicore__ __attribute__((always_inline)) inline void RunP24BlockedRounds
     vexp(m,m,1,1,1,8,8);
     pipe_barrier(PIPE_V);
     SetMaskNorm();
+    if constexpr(AlignedRows) {
+      // Canonical zero padding lets all three aligned planes share one sum.
+      if(h<24) {
+        WideRoundMask(~lastMask);
+        vector_dup(m+2*plane,0.0f,rp/8,1,1,8,0);
+      }
+      WideRoundMask(~uint64_t{0});
+      // Full-repeat row operations may read up to63 unused tail sums.
+      vector_dup(partial+3*rp,0.0f,1,1,1,8,0);
+      pipe_barrier(PIPE_V);
+    }
     for(uint32_t round=0;round<iters;++round) {
-      for(uint32_t b=0;b<3;++b) {
+      if constexpr(AlignedRows) {
+        WideRoundMask(~uint64_t{0});
+        vcgadd(partial,m,3*rp/8,1,1,8);
+      } else for(uint32_t b=0;b<3;++b) {
         const uint64_t mask=b==2 ? lastMask : ~uint64_t{0};
         WideRoundMask(mask);
         // Matrix has 64 extra floats. Up to seven extra row sums stay in
@@ -298,24 +362,82 @@ static __aicore__ __attribute__((always_inline)) inline void RunP24BlockedRounds
         vcgadd(partial+b*rp,m+b*plane,rp/8,1,1,8);
       }
       pipe_barrier(PIPE_V);
-      SetMaskCount();
-      SetVectorMask<float,MaskMode::COUNTER>(0,rows);
-      vadd(r,partial,partial+rp,1,1,1,1,8,8,8);
-      if(round) vadds(partial+2*rp,partial+2*rp,eps,1,1,1,8,8);
+      if constexpr(!AlignedRows) {
+        SetMaskCount();SetVectorMask<float,MaskMode::COUNTER>(0,rows);
+      }
+      const uint8_t rowRepeats=AlignedRows?(rows+63)/64:1;
+      vadd(r,partial,partial+rp,rowRepeats,1,1,1,8,8,8);
+      if(round) vadds(partial+2*rp,partial+2*rp,eps,rowRepeats,1,1,8,8);
       pipe_barrier(PIPE_V);
-      vadd(r,r,partial+2*rp,1,1,1,1,8,8,8);
+      vadd(r,r,partial+2*rp,rowRepeats,1,1,1,8,8,8);
       pipe_barrier(PIPE_V);
-      vdiv(r,ones,r,1,1,1,1,8,8,8);
+      vdiv(r,ones,r,rowRepeats,1,1,1,8,8,8);
       pipe_barrier(PIPE_V);
-      SetMaskNorm();WideRoundMask(~uint64_t{0});
+      if constexpr(!AlignedRows) SetMaskNorm();
+      WideRoundMask(~uint64_t{0});
       vbrcb(reinterpret_cast<__ubuf__ uint32_t *>(tmp),reinterpret_cast<__ubuf__ uint32_t *>(r),1,8,rp/8);
       pipe_barrier(PIPE_V);
+      if constexpr(AlignedRows) {
+        SetMaskNorm();
+        ScaleP24Exchange<false>(alternate,m,tmp,h,n,plane);
+        pipe_barrier(PIPE_V);
+        const uint32_t width=24*n,half=h/2,pitch=h-half;
+        SetMaskCount();
+        if(!round) {
+          SetVectorMask<float,MaskMode::COUNTER>(0,h*width);
+          vadds(alternate,alternate,eps,1,1,1,8,8);
+          pipe_barrier(PIPE_V);
+        }
+        SetVectorMask<float,MaskMode::COUNTER>(0,half*width);
+        vadd(partial,alternate,alternate+pitch*width,1,1,1,1,8,8,8);
+        if(h%2) {
+          SetVectorMask<float,MaskMode::COUNTER>(0,width);
+          vadds(partial+half*width,alternate+half*width,eps,1,1,1,8,8);
+        }
+        pipe_barrier(PIPE_V);
+        uint32_t height=pitch;
+        for(;height>TailRows;) {
+          const uint32_t pairs=height/2,upper=height-pairs;
+          SetVectorMask<float,MaskMode::COUNTER>(0,pairs*width);
+          vadd(partial,partial,partial+upper*width,1,1,1,1,8,8,8);
+          pipe_barrier(PIPE_V);height=upper;
+        }
+        SetMaskNorm();
+        for(uint32_t off=0;off<width;off+=64) {
+          const uint32_t live=width-off<64?width-off:64;
+          WideRoundMask(live==64?~uint64_t{0}:(uint64_t{1}<<live)-1);
+          auto acc=partial+off;
+          vadd(acc,acc+width,acc,height-1,1,1,1,0,width/8,0);
+        }
+        pipe_barrier(PIPE_V);
+        SetMaskCount();SetVectorMask<float,MaskMode::COUNTER>(0,width);
+        if(!(h%2)) {vadds(partial,partial,eps,1,1,1,8,8);pipe_barrier(PIPE_V);}
+        vdiv(d,ones,partial,1,1,1,1,8,8,8);
+        pipe_barrier(PIPE_V);
+        SetMaskNorm();
+        ScaleP24Exchange<true>(m,alternate,d,h,n,plane);
+        pipe_barrier(PIPE_V);
+        if(!round && h<24) {
+          // Padding columns are independent in the column reduction. Restore
+          // zero after the first eps-add before the next row reduction.
+          WideRoundMask(~lastMask);
+          vector_dup(m+2*plane,0.0f,rp/8,1,1,8,0);
+          pipe_barrier(PIPE_V);
+        }
+      } else {
       SetMaskCount();SetVectorMask<float,MaskMode::COUNTER>(0,plane);
       for(uint32_t b=0;b<3;++b) vmul(m+b*plane,m+b*plane,tmp,1,1,1,1,8,8,8);
       pipe_barrier(PIPE_V);
       if(!round) {
         SetVectorMask<float,MaskMode::COUNTER>(0,3*plane);
         vadds(m,m,eps,1,1,1,8,8);pipe_barrier(PIPE_V);
+        if constexpr(AlignedRows) {
+          if(h<24) {
+            SetMaskNorm();WideRoundMask(~lastMask);
+            vector_dup(m+2*plane,0.0f,rp/8,1,1,8,0);
+            pipe_barrier(PIPE_V);
+          }
+        }
       }
       SetMaskNorm();WideRoundMask(~uint64_t{0});
       // Compact all three column planes with the same binary row tree.
@@ -331,13 +453,37 @@ static __aicore__ __attribute__((always_inline)) inline void RunP24BlockedRounds
           vadds(partial+b*work+half*span,m+b*plane+half*span,eps,1,1,1,8,8);
       }
       pipe_barrier(PIPE_V);
-      for(uint32_t height=pitch;height>2;) {
+      uint32_t height=pitch;
+      const uint32_t stop=n<=255?TailRows:2;
+      for(;height>stop;) {
         const uint32_t pairs=height/2, upper=height-pairs;
         SetVectorMask<float,MaskMode::COUNTER>(0,pairs*span);
         for(uint32_t b=0;b<3;++b)
           vadd(partial+b*work,partial+b*work,partial+b*work+upper*span,1,1,1,1,8,8,8);
         pipe_barrier(PIPE_V);height=upper;
       }
+      if constexpr (TailRows > 2) {
+        if(n<=255) {
+          SetMaskNorm();
+          for(uint32_t off=0;off<span;off+=64) {
+            const uint32_t width=span-off<64?span-off:64;
+            WideRoundMask(width==64?~uint64_t{0}:(uint64_t{1}<<width)-1);
+            for(uint32_t b=0;b<3;++b) {
+              auto acc=partial+b*work+off;
+              // Supported dependent-repeat form: dst aliases src1 only;
+              // dst/src1 repeat stride zero, src0 rows are disjoint.
+              vadd(acc,acc+span,acc,height-1,1,1,1,0,n,0);
+            }
+          }
+          pipe_barrier(PIPE_V);
+          SetMaskCount();SetVectorMask<float,MaskMode::COUNTER>(0,span);
+          if(!(h%2)) {
+            for(uint32_t b=0;b<3;++b) vadds(partial+b*work,partial+b*work,eps,1,1,1,8,8);
+            pipe_barrier(PIPE_V);
+          }
+          for(uint32_t b=0;b<3;++b) vdiv(d+b*span,ones,partial+b*work,1,1,1,1,8,8,8);
+          pipe_barrier(PIPE_V);
+        } else {
       SetVectorMask<float,MaskMode::COUNTER>(0,span);
       for(uint32_t b=0;b<3;++b)
         vadd(d+b*span,partial+b*work,partial+b*work+span,1,1,1,1,8,8,8);
@@ -345,6 +491,16 @@ static __aicore__ __attribute__((always_inline)) inline void RunP24BlockedRounds
       SetVectorMask<float,MaskMode::COUNTER>(0,3*span);
       if(!(h%2)) {vadds(d,d,eps,1,1,1,8,8);pipe_barrier(PIPE_V);}
       vdiv(d,ones,d,1,1,1,1,8,8,8);pipe_barrier(PIPE_V);
+        }
+      } else {
+      SetVectorMask<float,MaskMode::COUNTER>(0,span);
+      for(uint32_t b=0;b<3;++b)
+        vadd(d+b*span,partial+b*work,partial+b*work+span,1,1,1,1,8,8,8);
+      pipe_barrier(PIPE_V);
+      SetVectorMask<float,MaskMode::COUNTER>(0,3*span);
+      if(!(h%2)) {vadds(d,d,eps,1,1,1,8,8);pipe_barrier(PIPE_V);}
+      vdiv(d,ones,d,1,1,1,1,8,8,8);pipe_barrier(PIPE_V);
+      }
       SetMaskNorm();
       WideRoundMask(~uint64_t{0});
       uint32_t off=0;
@@ -371,11 +527,61 @@ static __aicore__ __attribute__((always_inline)) inline void RunP24BlockedRounds
         }
       }
       pipe_barrier(PIPE_V);
+      }
     }
     WideRoundMask(~uint64_t{0});
   }
 }
 
+// A separate block owns pre/post for the entire bounded batch. Matrix blocks
+// neither wait on this role nor read its outputs; all roles share one launch.
+static __aicore__ inline void RunP24GateRole(GM_ADDR mixes,GM_ADDR pre,GM_ADDR post,
+                                           uint32_t h,uint32_t tokens,float eps) {
+  if ASCEND_IS_AIV {
+    const uint32_t pitch=(2*h+7)/8*8,g=h*tokens,p=(g+63)/64*64,count=pitch*tokens;
+    GlobalTensor<float> input,preOut,postOut;
+    input.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(mixes));
+    preOut.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(pre));
+    postOut.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(post));
+    TPipe pipe;TBuf<TPosition::VECCALC> inBuf,outBuf,indexBuf,oneBuf;
+    pipe.InitBuffer(inBuf,4*count);pipe.InitBuffer(outBuf,8*p);
+    pipe.InitBuffer(indexBuf,4*p);pipe.InitBuffer(oneBuf,256);
+    auto dense=inBuf.Get<float>();auto output=outBuf.Get<float>();
+    auto index=indexBuf.Get<int32_t>();auto row=output.ReinterpretCast<int32_t>();
+    auto one=oneBuf.Get<float>();
+    const DataCopyExtParams in{static_cast<uint16_t>(tokens),8*h,4*h*h,0,0};
+    const DataCopyPadExtParams<float> padding{true,0,static_cast<uint8_t>(pitch-2*h),0.0f};
+    DataCopyPad(dense,input,in,padding);
+    Duplicate(one,1.0f,64);CreateVecIndex(index,int32_t{0},g);PipeBarrier<PIPE_V>();
+    Muls(row,index,static_cast<int32_t>(((1U<<20)+h-1)/h),g);PipeBarrier<PIPE_V>();
+    ShiftRight(row,row,int32_t{20},g);PipeBarrier<PIPE_V>();
+    Muls(row,row,static_cast<int32_t>(pitch-h),g);PipeBarrier<PIPE_V>();
+    Add(index,index,row,g);PipeBarrier<PIPE_V>();
+    Muls(index,index,int32_t{4},g);PipeBarrier<PIPE_V>();
+    SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
+    auto x=reinterpret_cast<__ubuf__ float *>(dense.GetPhyAddr());
+    auto o=reinterpret_cast<__ubuf__ float *>(one.GetPhyAddr());
+    SetMaskCount();
+    for(uint32_t first=0;first<count;first+=16320) {
+      const uint32_t live=count-first<16320?count-first:16320;
+      SetVectorMask<float,MaskMode::COUNTER>(0,live);
+      vmuls(x+first,x+first,-1.0f,1,1,1,8,8);pipe_barrier(PIPE_V);
+      vmins(x+first,x+first,80.0f,1,1,1,8,8);pipe_barrier(PIPE_V);
+      vexp(x+first,x+first,1,1,1,8,8);pipe_barrier(PIPE_V);
+      vadds(x+first,x+first,1.0f,1,1,1,8,8);pipe_barrier(PIPE_V);
+      vdiv(x+first,o,x+first,1,1,1,1,8,0,8);pipe_barrier(PIPE_V);
+    }
+    SetMaskNorm();ResetMask();
+    Gather(output,dense,index.ReinterpretCast<uint32_t>(),uint32_t{0},g);
+    Gather(output[p],dense,index.ReinterpretCast<uint32_t>(),4*h,g);PipeBarrier<PIPE_V>();
+    Adds(output,output,eps,g);Muls(output[p],output[p],2.0f,g);PipeBarrier<PIPE_V>();
+    SetFlag<HardEvent::V_MTE3>(EVENT_ID0);WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
+    const DataCopyExtParams out{1,4*g,0,0,0};
+    DataCopyPad(preOut,output,out);DataCopyPad(postOut,output[p],out);
+  }
+}
+
+template <bool AlignedRows = false>
 class NarrowP24RecurrentKernel {
  public:
   __aicore__ inline void Init(GM_ADDR mixes, GM_ADDR pre, GM_ADDR post,
@@ -410,11 +616,11 @@ class NarrowP24RecurrentKernel {
     const uint32_t denseBytes =
         (4 * zero_offset_ + 32) + 4 * (dense_gate_cap_ + matrixCap) +
         4 * (input_gate_cap_ + inputMatrixCap);
-    use_dense_io_ = (baseBytes + denseBytes <= 188416);
+    use_dense_io_ = (baseBytes + denseBytes + (AlignedRows?1536:0) <= 188416);
 
     // Allocate +256B (64 floats) tail padding on UB buffers to allow full-repeat
     // vector execution without SetVectorMask tail splitting.
-    pipe_.InitBuffer(matrixBuffer_, t_.matrix_bytes + 256);
+    pipe_.InitBuffer(matrixBuffer_, t_.matrix_bytes + 256 + (AlignedRows?768:0));
     pipe_.InitBuffer(gateBuffer_, 2 * t_.gate_bytes + 256);
     pipe_.InitBuffer(partialBuffer_,
                      t_.input_bytes + (tmp + rp) * sizeof(float) + 256);
@@ -427,7 +633,7 @@ class NarrowP24RecurrentKernel {
       // automatically zero-pads lanes h..23 of matrix_ and gates_!
       pipe_.InitBuffer(denseOutputBuffer_, 4 * zero_offset_ + 32);
       pipe_.InitBuffer(outputIndexBuffer_, 4 * (dense_gate_cap_ + matrixCap));
-      pipe_.InitBuffer(inputIndexBuffer_, 4 * (input_gate_cap_ + inputMatrixCap));
+      pipe_.InitBuffer(inputIndexBuffer_, 4 * (input_gate_cap_ + inputMatrixCap) + (AlignedRows?768:0));
 
       dense_output_ = denseOutputBuffer_.Get<float>();
       output_index_ = outputIndexBuffer_.Get<int32_t>();
@@ -449,6 +655,7 @@ class NarrowP24RecurrentKernel {
     denom_ = denomBuffer_.Get<float>();
   }
 
+  template <bool MatrixOnly = false>
   __aicore__ inline void Process() {
     for (uint64_t offset = 0; offset < count_; offset += t_.tile_tokens) {
       const uint64_t first = start_ + offset;
@@ -457,23 +664,25 @@ class NarrowP24RecurrentKernel {
       rows_ = t_.h * valid_;
       span_ = t_.h_pad * valid_;
 
-      if (use_dense_io_) {
-        CopyInAndBuildMaps(first);
-        GatesAndRowMax();
+      if (MatrixOnly || use_dense_io_) {
+        CopyInAndBuildMaps<MatrixOnly>(first);
+        if constexpr(MatrixOnly) RowMaxOnly();
+        else GatesAndRowMax();
       } else {
         CopyInAndGatesStrided(first);
         RowMaxOnly();
       }
 
       SetMaskNorm();
-      if (use_dense_io_) {
-      RunP24BlockedRounds(
+      if (MatrixOnly || use_dense_io_) {
+      RunP24BlockedRounds<MatrixOnly ? 3 : 2, AlignedRows>(
           reinterpret_cast<__ubuf__ float *>(matrix_.GetPhyAddr()),
           reinterpret_cast<__ubuf__ float *>(partial_.GetPhyAddr()),
           reinterpret_cast<__ubuf__ float *>(tmp_.GetPhyAddr()),
           reinterpret_cast<__ubuf__ float *>(result_.GetPhyAddr()),
           reinterpret_cast<__ubuf__ float *>(ones_.GetPhyAddr()),
           reinterpret_cast<__ubuf__ float *>(denom_.GetPhyAddr()),
+          reinterpret_cast<__ubuf__ float *>(AlignedRows ? input_index_.GetPhyAddr() : uint64_t{0}),
           t_.h, valid_, t_.eps, t_.iters);
       } else {
       RunP24CompleteRounds(
@@ -487,7 +696,7 @@ class NarrowP24RecurrentKernel {
       }
       ResetMask();
 
-      if (use_dense_io_) {
+      if (MatrixOnly || use_dense_io_) {
         // Queue comb Gather onto PIPE_V first, then issue contiguous pre/post MTE3 DMA
         // writebacks while PIPE_V executes the 20 Sinkhorn rounds and comb Gather!
         const uint32_t gates = t_.h * valid_;
@@ -496,10 +705,12 @@ class NarrowP24RecurrentKernel {
         Gather(dense_output_[2 * dense_gate_cap_], matrix_,
                gateIndex[dense_gate_cap_], uint32_t{0}, matrix);
 
+        if constexpr(!MatrixOnly) {
         WaitFlag<HardEvent::V_MTE3>(EVENT_ID1);
         const DataCopyExtParams gOut{1, 4 * gates, 0, 0, 0};
         DataCopyPad(pre_[first * t_.h], dense_output_, gOut);
         DataCopyPad(post_[first * t_.h], dense_output_[dense_gate_cap_], gOut);
+        }
 
         CopyOutComb(first, matrix, offset + t_.tile_tokens < count_);
       } else {
@@ -537,6 +748,7 @@ class NarrowP24RecurrentKernel {
     PipeBarrier<PIPE_V>();
   }
 
+  template <bool MatrixOnly>
   __aicore__ inline void BuildDenseInputMaps() {
     CreateVecIndex(input_index_, int32_t{0}, t_.h_pad);
     PipeBarrier<PIPE_V>();Muls(input_index_,input_index_,int32_t{4},t_.h_pad);
@@ -546,28 +758,37 @@ class NarrowP24RecurrentKernel {
     for(uint32_t tokens=1;tokens<valid_;tokens*=2) {
       const uint32_t n=valid_-tokens<tokens ? valid_-tokens : tokens;
       const int32_t offset=4*tokens*t_.input_width;
-      Adds(input_index_[tokens*24],input_index_,offset,n*24);
+      if constexpr(!MatrixOnly) Adds(input_index_[tokens*24],input_index_,offset,n*24);
       Adds(dst[tokens*8],dst,offset,n*8);
       PipeBarrier<PIPE_V>();
     }
-    Adds(input_index_[span_],input_index_,static_cast<int32_t>(4*t_.h),span_);
+    if constexpr(!MatrixOnly) Adds(input_index_[span_],input_index_,static_cast<int32_t>(4*t_.h),span_);
     for(uint32_t rows=1;rows<t_.h;rows*=2) {
       const uint32_t n=t_.h-rows<rows ? t_.h-rows : rows;
       Adds(dst[rows*valid_*8],dst,static_cast<int32_t>(4*rows*t_.h),n*valid_*8);PipeBarrier<PIPE_V>();
     }
-    Adds(dst[rows_*8],dst,int32_t{32},rows_*8);
-    Adds(dst[rows_*16],dst,int32_t{64},rows_*8);PipeBarrier<PIPE_V>();
+    const uint32_t plane=(AlignedRows?(rows_+7)/8*8:rows_)*8;
+    Adds(dst[plane],dst,int32_t{32},rows_*8);
+    Adds(dst[2*plane],dst,int32_t{64},rows_*8);PipeBarrier<PIPE_V>();
+    if constexpr(AlignedRows) {
+      if(plane>rows_*8) {
+        for(uint32_t b=0;b<3;++b)
+          Duplicate(dst[b*plane+rows_*8],static_cast<int32_t>(4*zero_offset_),plane-rows_*8);
+        PipeBarrier<PIPE_V>();
+      }
+    }
     if(t_.h<24) {
       uint64_t mask[2]={uint64_t{255}^((uint64_t{1}<<(t_.h-16))-1),0};
       for(uint32_t first=0;first<rows_;first+=248) {
         const uint32_t n=rows_-first<248?rows_-first:248;
-        Duplicate(dst[rows_*16+first*8],static_cast<int32_t>(4*zero_offset_),mask,
+        Duplicate(dst[2*plane+first*8],static_cast<int32_t>(4*zero_offset_),mask,
                   static_cast<uint8_t>(n),uint16_t{1},uint8_t{1});
       }
       PipeBarrier<PIPE_V>();
     }
   }
 
+  template <bool MatrixOnly>
   __aicore__ inline void CopyInAndBuildMaps(uint64_t first) {
     // Issue single contiguous bulk MTE2 DMA read first so constants and index maps build on PIPE_V in parallel!
     const DataCopyExtParams packed{1, 4 * valid_ * t_.input_width, 0, 0, 0};
@@ -581,7 +802,7 @@ class NarrowP24RecurrentKernel {
       PipeBarrier<PIPE_V>();
       constants_ready_ = true;
     }
-    if (!gate_output_map_ready_) {
+    if (!MatrixOnly && !gate_output_map_ready_) {
       BuildDenseOutputMap<false>(output_index_, t_.h * t_.tile_tokens);
       gate_output_map_ready_ = true;
     }
@@ -601,13 +822,13 @@ class NarrowP24RecurrentKernel {
     }
     // Output maps borrow matrix/input-index storage before Gather populates it.
     if (input_indexed_valid_ != valid_) {
-      BuildDenseInputMaps();
+      BuildDenseInputMaps<MatrixOnly>();
       input_indexed_valid_ = valid_;
     }
     Sync<HardEvent::MTE2_V>();
     auto index = input_index_.template ReinterpretCast<uint32_t>();
-    Gather(gates_, dense_output_, index, uint32_t{0}, 2 * span_);
-    Gather(matrix_, dense_output_, index[2 * span_], uint32_t{0}, t_.h * span_);
+    if constexpr(!MatrixOnly) Gather(gates_, dense_output_, index, uint32_t{0}, 2 * span_);
+    Gather(matrix_, dense_output_, index[2 * span_], uint32_t{0}, AlignedRows?24*((rows_+7)/8*8):t_.h*span_);
     PipeBarrier<PIPE_V>();
   }
 
@@ -620,7 +841,7 @@ class NarrowP24RecurrentKernel {
     P24FoldRowMax(reinterpret_cast<__ubuf__ float *>(matrix_.GetPhyAddr()),
                   reinterpret_cast<__ubuf__ float *>(partial_.GetPhyAddr()),
                   reinterpret_cast<__ubuf__ float *>(result_.GetPhyAddr()),
-                  t_.h, rows_, use_dense_io_);
+                  t_.h, rows_, use_dense_io_, AlignedRows);
     PipeBarrier<PIPE_V>();
 
     Mins(tmp_, tmp_, 80.0f, n);
@@ -664,7 +885,7 @@ class NarrowP24RecurrentKernel {
         Muls(token,row,static_cast<int32_t>(t_.h),length);PipeBarrier<PIPE_V>();
         Sub(token,dst,token,length);PipeBarrier<PIPE_V>();
         ShiftRight(token,token,int32_t{3},length);PipeBarrier<PIPE_V>();
-        Muls(token,token,static_cast<int32_t>(8*rows_-8),length);PipeBarrier<PIPE_V>();
+        Muls(token,token,static_cast<int32_t>(8*(AlignedRows?(rows_+7)/8*8:rows_)-8),length);PipeBarrier<PIPE_V>();
         Add(dst,dst,token,length);PipeBarrier<PIPE_V>();
         Muls(token,row,reciprocal,length);PipeBarrier<PIPE_V>();
         ShiftRight(token,token,int32_t{20},length);PipeBarrier<PIPE_V>();
@@ -741,7 +962,7 @@ class NarrowP24RecurrentKernel {
     P24FoldRowMax(reinterpret_cast<__ubuf__ float *>(matrix_.GetPhyAddr()),
                   reinterpret_cast<__ubuf__ float *>(partial_.GetPhyAddr()),
                   reinterpret_cast<__ubuf__ float *>(result_.GetPhyAddr()),
-                  t_.h, rows_, use_dense_io_);
+                  t_.h, rows_, use_dense_io_, AlignedRows);
     PipeBarrier<PIPE_V>();
   }
 
@@ -777,14 +998,48 @@ class NarrowP24RecurrentKernel {
 }  // namespace f08
 }  // namespace sinkhorn_norm
 
-template <int = 0>
+template <int SplitGates = 0>
 __global__ __aicore__ __attribute__((aligned(64))) void sinkhorn_f08_kernel(
     GM_ADDR mixes, GM_ADDR pre, GM_ADDR post, GM_ADDR comb,
     sinkhorn_norm::TilingData tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-  sinkhorn_norm::f08::NarrowP24RecurrentKernel op;
-  op.Init(mixes, pre, post, comb, tiling);
-  op.Process();
+  if constexpr(SplitGates) {
+    if(AscendC::GetBlockIdx()==tiling.core_count-1) {
+      sinkhorn_norm::f08::RunP24GateRole(mixes,pre,post,tiling.h,tiling.token_count,tiling.eps);
+    } else {
+      --tiling.core_count;
+      tiling.tokens_per_core=tiling.token_count/tiling.core_count;
+      tiling.extra_core_count=tiling.token_count%tiling.core_count;
+      sinkhorn_norm::f08::NarrowP24RecurrentKernel<> op;
+      op.Init(mixes,pre,post,comb,tiling);op.Process<true>();
+    }
+  } else {
+    sinkhorn_norm::f08::NarrowP24RecurrentKernel<> op;
+    op.Init(mixes, pre, post, comb, tiling);op.Process();
+  }
+}
+
+// Compact entry for the existing bounded shared-gate layout only.
+template <int SplitGates>
+__global__ __aicore__ __attribute__((aligned(64))) void sinkhorn_f08_kernel(
+    GM_ADDR mixes, GM_ADDR pre, GM_ADDR post, GM_ADDR comb,
+    sinkhorn_norm::P24SharedArgs args) {
+  static_assert(SplitGates == 1, "Shared-gate metadata contract");
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  const uint32_t cores=AscendC::GetBlockNum();
+  if(AscendC::GetBlockIdx()==cores-1) {
+    sinkhorn_norm::f08::RunP24GateRole(mixes,pre,post,args.h,args.tokens,args.eps);
+  } else {
+    sinkhorn_norm::TilingData t{};
+    t.eps=args.eps;t.iters=args.iters;t.h=args.h;t.h_pad=24;
+    t.token_count=args.tokens;t.core_count=cores-1;
+    t.tokens_per_core=args.tokens/t.core_count;t.extra_core_count=args.tokens%t.core_count;
+    t.tile_tokens=args.tile;t.input_width=args.h*(args.h+2);
+    t.input_bytes=32*args.h*args.tile;t.matrix_bytes=96*args.h*args.tile;
+    t.gate_bytes=96*args.tile;
+    sinkhorn_norm::f08::NarrowP24RecurrentKernel<true> op;
+    op.Init(mixes,pre,post,comb,t);op.Process<true>();
+  }
 }
 
 #endif  // SINKHORN_NORM_KERNELS_F08_NARROW_P24_RECURRENT_H_

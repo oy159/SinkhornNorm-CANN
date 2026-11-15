@@ -34,6 +34,42 @@ static_assert(offsetof(TilingData, eps) == 0 &&
 
 using CompactFrontArgs = TilingData;
 
+// Minimal short-batch launch arguments. All buffer dimensions are derived
+// from the admitted P16 layout and the per-core token ownership.
+struct ShortNarrowArgs {
+  float eps;
+  std::uint32_t iters;
+  std::uint32_t h;
+  std::uint32_t owner;
+  std::uint32_t extra;
+};
+static_assert(sizeof(ShortNarrowArgs) == 20, "Short narrow argument ABI");
+
+// F07 admission fixes padded width16 and all buffer sizes from H/tile.
+struct NarrowDenseArgs {
+  std::uint64_t owner;
+  float eps;
+  std::uint32_t iters, h, extra, tile;
+};
+static_assert(sizeof(NarrowDenseArgs) == 32, "Narrow dense argument ABI");
+
+// Shared-gate P24 admits a bounded batch and a fixed padded width of24.
+// Only launch metadata crosses the ABI; all tensor work stays on device.
+struct P24SharedArgs {
+  float eps;
+  std::uint32_t iters, h, tokens, tile;
+};
+static_assert(sizeof(P24SharedArgs)==20, "P24 shared argument ABI");
+
+
+// Full-width ownership and compact medium layout metadata.
+struct MediumCompactArgs {
+  std::uint64_t owner;
+  float eps;
+  std::uint32_t iters, h, input_bytes, extra, tile;
+};
+static_assert(sizeof(MediumCompactArgs) == 32, "Compact medium argument ABI");
+
 struct TinyThreeRowArgs {
   float eps;
   std::uint32_t iters;
@@ -232,6 +268,27 @@ inline bool UsesDenseNarrowIo(const TilingData &t) {
          t.scratch_bytes==DenseNarrowScratchBytes(t.h,t.tile_tokens);
 }
 
+// Long narrow tiles can amortize the dense transpose across repeated rounds.
+inline bool IsLongNarrowPlaneWorkload(std::uint64_t h, std::uint64_t pitch,
+                                     std::uint64_t iters, std::uint64_t owner,
+                                     std::uint64_t tile, float eps) {
+  return h >= 9 && h < 16 && pitch == 16 && iters >= 8 && iters <= 32 &&
+         owner >= 16 && tile >= 16 && tile <= 64 && tile % 16 == 0 &&
+         HasNormalInverseEpsilon(h, eps);
+}
+
+inline bool UsesLongNarrowPlanes(const TilingData &t) {
+  return IsLongNarrowPlaneWorkload(t.h, t.h_pad, t.iters, t.tokens_per_core,
+                                   t.tile_tokens, t.eps) &&
+         t.core_count != 0 && t.tokens_per_core == t.token_count / t.core_count &&
+         t.extra_core_count == t.token_count % t.core_count &&
+         t.input_width == t.h * (t.h + 2) &&
+         t.input_bytes == DenseNarrowInputBytes(t.h, t.tile_tokens) &&
+         t.matrix_bytes == DenseNarrowMatrixBytes(t.h, t.tile_tokens) &&
+         t.gate_bytes == 4 * 16 * t.tile_tokens &&
+         t.scratch_bytes == DenseNarrowScratchBytes(t.h, t.tile_tokens);
+}
+
 // [F09_MediumDenseIo / C5]: medium non-aligned H in [33, 56] with padded rows & dense IO.
 inline std::uint64_t NarrowGroupedRowPaddingBytes(std::uint64_t h,
                                                   std::uint64_t h_pad,
@@ -320,7 +377,7 @@ inline bool UsesRotatingQuarters(const TilingData &t) {
     return false;
   const std::uint64_t rows = std::uint64_t{t.h} * t.tile_tokens;
   const std::uint64_t span = std::uint64_t{t.h_pad} * t.tile_tokens;
-  const auto rotating_scratch = 4 * (17 * rows + 3 * span);
+  const auto rotating_scratch = 4 * (17 * rows + 5 * span) + 256;
   return t.matrix_bytes == 132352 && t.input_bytes == 33024 &&
          t.gate_bytes == 4 * span && t.scratch_bytes == rotating_scratch;
 }
@@ -331,6 +388,13 @@ inline bool IsAlignedMediumWorkload(std::uint64_t h, std::uint64_t pitch,
   return h == 64 && pitch == 64 && iters >= 8 && HasNormalInverseEpsilon(h, eps);
 }
 
+inline constexpr uint32_t kAlignedMediumFactorHistoryBytes = 4096;
+
+inline uint32_t AlignedMediumAlternateScratch(const TilingData &t) {
+  return 13 * t.h_pad * t.tile_tokens * sizeof(float) + 256 +
+         t.matrix_bytes + 512;
+}
+
 inline bool UsesAlignedMedium(const TilingData &t) {
   if (!IsAlignedMediumWorkload(t.h, t.h_pad, t.iters, t.eps) ||
       !UsesInterleavedLayout(t))
@@ -338,7 +402,9 @@ inline bool UsesAlignedMedium(const TilingData &t) {
   const uint32_t span = t.h_pad * t.tile_tokens;
   const uint32_t phased_scratch = 13 * span * sizeof(float) + 256;
   return t.scratch_bytes == phased_scratch ||
-         t.scratch_bytes == phased_scratch + t.matrix_bytes + 512;
+         t.scratch_bytes == AlignedMediumAlternateScratch(t) ||
+         (t.tile_tokens == 4 && t.scratch_bytes ==
+          AlignedMediumAlternateScratch(t) + kAlignedMediumFactorHistoryBytes);
 }
 
 // [F13_WideQuarterStream / p9]: H=100, N=768, iter=32 quarter-stream capacity 5
@@ -419,6 +485,27 @@ inline bool UsesCompactMediumWorkspace(const TilingData &t) {
   const auto tmp = 8 * rp > 6 * span ? 8 * rp : 6 * span;
   const auto ones = rp > 2 * span ? rp : 2 * span;
   return t.scratch_bytes == 4 * (tmp + rp + ones + span);
+}
+
+// Reserve one existing block for batched Gates only when matrix blocks retain
+// their original maximum tile load and both roles fit the current UB budgets.
+inline bool UsesP24SharedGate(const TilingData &t) {
+  if(t.h<17 || t.h>24 || t.h_pad!=24 || t.core_count<2 ||
+     t.token_count==0 || t.token_count>4095 ||
+     (t.token_count+t.core_count-2)/(t.core_count-1)>t.tile_tokens) return false;
+  const std::uint64_t pitch=(2*t.h+7)/8*8;
+  const std::uint64_t gate=(t.token_count*t.h+63)/64*64;
+  if(4*(pitch*t.token_count+3*gate+64)>188416) return false;
+  const std::uint64_t rows=std::uint64_t{t.h}*t.tile_tokens;
+  const std::uint64_t rp=(rows+7)/8*8,span=24ULL*t.tile_tokens;
+  const std::uint64_t tmp=8*rp>6*span?8*rp:6*span;
+  const std::uint64_t ones=rp>2*span?rp:2*span;
+  const std::uint64_t gc=(rows+63)/64*64,mc=(rows*t.h+63)/64*64;
+  const std::uint64_t ig=(2*span+63)/64*64,im=(rows*24+63)/64*64;
+  const std::uint64_t base=t.matrix_bytes+256+2*t.gate_bytes+256+
+      t.input_bytes+4*(tmp+rp)+256+4*rp+256+4*ones+256+4*span+256;
+  // Aligned P24 planes reserve768 extra bytes each for matrix and input maps.
+  return base+4*(2*gc+mc)+32+4*(gc+mc)+4*(ig+im)+1536<=188416;
 }
 
 }  // namespace sinkhorn_norm

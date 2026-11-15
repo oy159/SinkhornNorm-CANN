@@ -3,6 +3,7 @@
 
 #include "kernel_operator.h"
 #include "sinkhorn_norm/common/primitives.h"
+#include "sinkhorn_norm/common/normalization_forecast.h"
 #include "sinkhorn_norm/tiling_data.h"
 
 namespace sinkhorn_norm {
@@ -50,10 +51,69 @@ static __aicore__ __attribute__((always_inline)) inline void RunNarrowShortBatch
   }
 }
 
+static __aicore__ __attribute__((always_inline)) inline void CaptureShortDenominator(
+    __ubuf__ float *snapshot, __ubuf__ float *sum, __ubuf__ float *ones,
+    uint32_t count, uint32_t capacity) {
+  if ASCEND_IS_AIV {
+    SetMaskCount();
+    if (count < capacity) {
+      SetVectorMask<float, MaskMode::COUNTER>(0, capacity);
+      vector_dup(snapshot, 0.0f, (capacity + 63) / 64, 1, 1, 8, 0);
+      pipe_barrier(PIPE_V);
+    }
+    SetVectorMask<float, MaskMode::COUNTER>(0, count);
+    vsub(snapshot, sum, ones, (count + 63) / 64, 1, 1, 1, 8, 8, 8);
+    pipe_barrier(PIPE_V);
+    SetMaskNorm();
+    WideRoundMask(~uint64_t{0});
+  }
+}
+
+// Keep exact updates for tiles whose measured row residuals remain large.
+static __aicore__ __attribute__((always_inline)) inline bool ShortForecastAdmitted(
+    __ubuf__ float *recent, __ubuf__ float *scratch, uint32_t span) {
+  if ASCEND_IS_AIV {
+    SetMaskCount();
+    SetVectorMask<float, MaskMode::COUNTER>(0, span);
+    vabs(scratch, recent, 1, 1, 1, 8, 8);
+    pipe_barrier(PIPE_V);
+    vcgmax(scratch + span, scratch, 1, 1, 1, 8);
+    pipe_barrier(PIPE_V);
+    SetMaskNorm();
+    const uint32_t groups = span / 8;
+    WideRoundMask((uint64_t{1} << groups) - 1);
+    vcgmax(scratch, scratch + span, 1, 1, 1, 8);
+    WideRoundMask(~uint64_t{0});
+    const auto event = GetTPipePtr()->FetchEventID(HardEvent::V_S);
+    SetFlag<HardEvent::V_S>(event);
+    WaitFlag<HardEvent::V_S>(event);
+    constexpr float bound = 0x1p-10f;
+    return scratch[0] <= bound && (groups <= 8 || scratch[1] <= bound);
+  }
+  return false;
+}
+
+template <bool Multiply>
+static __aicore__ __attribute__((always_inline)) inline void ScaleShortColumns(
+    __ubuf__ float *matrix, __ubuf__ float *factor, uint32_t h, uint32_t span) {
+  if ASCEND_IS_AIV {
+    const uint8_t stride = static_cast<uint8_t>(span / 8);
+    for (uint32_t col = 0; col < span; col += 64) {
+      if (span - col < 64) WideRoundMask((uint64_t{1} << (span - col)) - 1);
+      if constexpr (Multiply)
+        vmul(matrix + col, matrix + col, factor + col, h, 1, 1, 1, stride, stride, 0);
+      else
+        vdiv(matrix + col, matrix + col, factor + col, h, 1, 1, 1, stride, stride, 0);
+    }
+    pipe_barrier(PIPE_V);
+  }
+}
+
 static __aicore__ __attribute__((always_inline)) inline void RunNarrowShortBatchCompleteRounds(
     __ubuf__ float *matrix, __ubuf__ float *partial, __ubuf__ float *ones,
     __ubuf__ float *denom, uint32_t h, uint32_t valid, float eps,
-    uint32_t iters) {
+    uint32_t iters, __ubuf__ float *history, uint32_t historyCapacity,
+    uint32_t partialCapacity) {
   if ASCEND_IS_AIV {
     const uint32_t rows = h * valid, span = 16 * valid;
     const uint32_t groups4 = (rows + 3) / 4;
@@ -65,11 +125,12 @@ static __aicore__ __attribute__((always_inline)) inline void RunNarrowShortBatch
     const uint32_t q4Stride = q4Repeats * 64;
     const uint32_t q2Repeats = (2 * span + 63) / 64;
     const uint32_t broadcasts = (rows + 7) / 8;
-    const uint8_t spanBlocks = static_cast<uint8_t>(span / 8);
     const uint64_t pairMask =
         ((uint64_t{1} << h) - 1) * uint64_t{0x0001000100010001};
-    const uint64_t colTailMask =
-        (span & 63) ? ((uint64_t{1} << (span & 63)) - 1) : ~uint64_t{0};
+    constexpr uint32_t steps = 6, tail = 8;
+    const bool forecast = iters >= 4 + steps + tail && eps >= 0x1p-24f &&
+        eps <= 1.0e-5f && historyCapacity >= 7 * span && partialCapacity >= 10 * span;
+    const uint32_t checkpoint = forecast ? iters - steps - tail : iters;
 
     // Softmax subtract-max using 16-lane broadcast + single contiguous pairMask vsub.
     WideRoundMask(~uint64_t{0});
@@ -87,26 +148,43 @@ static __aicore__ __attribute__((always_inline)) inline void RunNarrowShortBatch
 
     // Unified loop for Round 0 (Softmax row-scale + col-norm) and Rounds 1..iters-1.
     for (uint32_t round = 0; round < iters; ++round) {
-      WideRoundMask(pairMask);
-      vcgadd(partial, matrix, groups4, 1, 1, 8);
-      pipe_barrier(PIPE_V);
-      WideRoundMask(~uint64_t{0});
-      vcpadd(denom, partial, pairs32, 1, 1, 8);
-      pipe_barrier(PIPE_V);
-      if (round > 0) {
-        vadds(denom, denom, eps, rowRepeats, 1, 1, 8, 8);
+      const bool predict = round == checkpoint &&
+          ShortForecastAdmitted(history + ((round - 1) % 2) * 2 * span, partial, span);
+      const bool measure = forecast && round < checkpoint && round + 2 >= checkpoint;
+      auto snapshot = history + (round % 2) * 2 * span;
+      auto columns = history + 6 * span;
+      if (predict) {
+        ForecastDenominatorProduct<steps>(denom, columns, partial, history + 4 * span,
+            ones, history + ((round - 1) % 2) * 2 * span, snapshot, span, eps);
+      } else {
+        WideRoundMask(pairMask);
+        vcgadd(partial, matrix, groups4, 1, 1, 8);
         pipe_barrier(PIPE_V);
+        WideRoundMask(~uint64_t{0});
+        vcpadd(denom, partial, pairs32, 1, 1, 8);
+        pipe_barrier(PIPE_V);
+        if (measure) CaptureShortDenominator(snapshot, denom, ones, rows, span);
+        if (round > 0) {
+          vadds(denom, denom, eps, rowRepeats, 1, 1, 8, 8);
+          pipe_barrier(PIPE_V);
+        }
       }
-      vdiv(denom, ones, denom, rowRepeats, 1, 1, 1, 8, 8, 8);
-      pipe_barrier(PIPE_V);
 
       vbrcb(reinterpret_cast<__ubuf__ uint32_t *>(partial),
             reinterpret_cast<__ubuf__ uint32_t *>(denom), 2, 16, broadcasts);
       vbrcb(reinterpret_cast<__ubuf__ uint32_t *>(partial + 8),
             reinterpret_cast<__ubuf__ uint32_t *>(denom), 2, 16, broadcasts);
       pipe_barrier(PIPE_V);
-      vmul(matrix, matrix, partial, matRepeats, 1, 1, 1, 8, 8, 8);
+      if (predict)
+        vmul(matrix, matrix, partial, matRepeats, 1, 1, 1, 8, 8, 8);
+      else
+        vdiv(matrix, matrix, partial, matRepeats, 1, 1, 1, 8, 8, 8);
       pipe_barrier(PIPE_V);
+      if (predict) {
+        ScaleShortColumns<true>(matrix, columns, h, span);
+        round += steps - 1;
+        continue;
+      }
       if (round == 0) {
         vadds(matrix, matrix, eps, matRepeats, 1, 1, 8, 8);
         pipe_barrier(PIPE_V);
@@ -134,22 +212,11 @@ static __aicore__ __attribute__((always_inline)) inline void RunNarrowShortBatch
       pipe_barrier(PIPE_V);
       vadd(denom, partial, partial + span, spanRepeats, 1, 1, 1, 8, 8, 8);
       pipe_barrier(PIPE_V);
+      if (measure) CaptureShortDenominator(snapshot + span, denom, ones, span, span);
       vadds(denom, denom, eps, spanRepeats, 1, 1, 8, 8);
       pipe_barrier(PIPE_V);
-      vdiv(denom, ones, denom, spanRepeats, 1, 1, 1, 8, 8, 8);
-      pipe_barrier(PIPE_V);
 
-      uint32_t col = 0;
-      for (; col + 64 <= span; col += 64) {
-        vmul(matrix + col, matrix + col, denom + col, h, 1, 1, 1, spanBlocks,
-             spanBlocks, 0);
-      }
-      if (col < span) {
-        WideRoundMask(colTailMask);
-        vmul(matrix + col, matrix + col, denom + col, h, 1, 1, 1, spanBlocks,
-             spanBlocks, 0);
-      }
-      pipe_barrier(PIPE_V);
+      ScaleShortColumns<false>(matrix, denom, h, span);
     }
   }
 }
@@ -157,8 +224,22 @@ static __aicore__ __attribute__((always_inline)) inline void RunNarrowShortBatch
 class NarrowP16ShortBatchKernel {
  public:
   __aicore__ inline void Init(GM_ADDR mixes, GM_ADDR pre, GM_ADDR post,
-                              GM_ADDR comb, const sinkhorn_norm::TilingData &t) {
-    t_ = t;
+                              GM_ADDR comb, const sinkhorn_norm::ShortNarrowArgs &t) {
+    t_.eps = t.eps;
+    t_.iters = t.iters;
+    t_.h = t.h;
+    t_.h_pad = 16;
+    t_.core_count = GetBlockNum();
+    t_.tokens_per_core = t.owner;
+    t_.extra_core_count = t.extra;
+    t_.token_count = uint64_t{t.owner} * t_.core_count + t.extra;
+    t_.tile_tokens = t.owner + (t.extra != 0);
+    t_.input_width = t.h * (t.h + 2);
+    t_.input_bytes = 32 * t.h * t_.tile_tokens;
+    t_.matrix_bytes = 64 * t.h * t_.tile_tokens;
+    t_.gate_bytes = 64 * t_.tile_tokens;
+    t_.scratch_bytes = 0;  // Init computes the actual scratch extents below.
+
     const uint64_t core = GetBlockIdx();
     start_ = core * t_.tokens_per_core +
              (core < t_.extra_core_count ? core : t_.extra_core_count);
@@ -230,7 +311,9 @@ class NarrowP16ShortBatchKernel {
           reinterpret_cast<__ubuf__ float *>(partial_.GetPhyAddr()),
           reinterpret_cast<__ubuf__ float *>(ones_.GetPhyAddr()),
           reinterpret_cast<__ubuf__ float *>(denom_.GetPhyAddr()),
-          t_.h, valid_, t_.eps, t_.iters);
+          t_.h, valid_, t_.eps, t_.iters,
+          reinterpret_cast<__ubuf__ float *>(input_index_.GetPhyAddr()),
+          input_index_.GetSize(), partial_.GetSize());
       ResetMask();
 
       // Zero-gather, zero-dynamic-map direct hardware strided comb writeback!
@@ -313,13 +396,26 @@ class NarrowP16ShortBatchKernel {
   __aicore__ inline void GatesAndRowMax() {
     // Interleave Gate Muls(-1) with RowMax on matrix_!
     Muls(tmp_, gates_, -1.0f, 2 * span_);
-    for (uint32_t first = 0; first < rows_; first += 255) {
-      const int32_t count =
-          static_cast<int32_t>(rows_ - first < 255 ? rows_ - first : 255);
-      WholeReduceMax(denom_[first], matrix_[first * t_.h_pad],
-                     static_cast<int32_t>(t_.h), count, 1, 1,
-                     static_cast<int32_t>(t_.h_pad / 8),
-                     ReduceOrder::ORDER_ONLY_VALUE);
+    // Reduce eight independent 16-wide rows per repeat, rather than issuing
+    // a separate whole reduction for every row. Padding must not win the max.
+    if ASCEND_IS_AIV {
+      auto *matrix = reinterpret_cast<__ubuf__ float *>(matrix_.GetPhyAddr());
+      auto *partial = reinterpret_cast<__ubuf__ float *>(partial_.GetPhyAddr());
+      auto *denom = reinterpret_cast<__ubuf__ float *>(denom_.GetPhyAddr());
+      const uint64_t live = ((uint64_t{1} << t_.h) - 1) *
+                            uint64_t{0x0001000100010001};
+      SetMaskNorm();
+      if (t_.h < 16) {
+        WideRoundMask(~live);
+        vector_dup(matrix, -3.402823466e+38f, (rows_ * 16 + 63) / 64, 1, 1, 8, 0);
+        pipe_barrier(PIPE_V);
+      }
+      WideRoundMask(~uint64_t{0});
+      vmax(partial, matrix, matrix + 8, (rows_ + 7) / 8,
+           1, 2, 2, 8, 16, 16);
+      pipe_barrier(PIPE_V);
+      vcgmax(denom, partial, (rows_ + 7) / 8, 1, 1, 8);
+      ResetMask();
     }
     PipeBarrier<PIPE_V>();
 
@@ -333,17 +429,37 @@ class NarrowP16ShortBatchKernel {
   }
 
   __aicore__ inline void CopyOutCombStrided(uint64_t first, bool hasMoreTiles) {
+    const uint32_t n = valid_ * t_.h * t_.h;
+    auto row = partial_.ReinterpretCast<int32_t>();
+    auto token = dense_output_.ReinterpretCast<int32_t>();
+    const int32_t reciprocal = static_cast<int32_t>(((1u << 20) + t_.h - 1) / t_.h);
+    // For the bounded F05 index domain this integer reciprocal gives exact
+    // floor division. These are layout addresses, never computed tensor values.
+    CreateVecIndex(input_index_, int32_t{0}, n);
+    PipeBarrier<PIPE_V>();
+    Muls(row, input_index_, reciprocal, n);
+    PipeBarrier<PIPE_V>();
+    ShiftRight(row, row, int32_t{20}, n);
+    PipeBarrier<PIPE_V>();
+    Muls(token, row, reciprocal, n);
+    PipeBarrier<PIPE_V>();
+    ShiftRight(token, token, int32_t{20}, n);
+    PipeBarrier<PIPE_V>();
+    Muls(row, row, static_cast<int32_t>(span_ - t_.h), n);
+    Muls(token, token, int32_t{16} - static_cast<int32_t>(t_.h * span_), n);
+    PipeBarrier<PIPE_V>();
+    Add(input_index_, input_index_, row, n);
+    PipeBarrier<PIPE_V>();
+    Add(input_index_, input_index_, token, n);
+    PipeBarrier<PIPE_V>();
+    Muls(input_index_, input_index_, int32_t{4}, n);
+    PipeBarrier<PIPE_V>();
+    Gather(dense_output_, matrix_, input_index_.ReinterpretCast<uint32_t>(), uint32_t{0}, n);
     Sync<HardEvent::V_MTE3>();
-    const uint32_t stride = (valid_ - 1) * t_.h_pad / 8;
-    const DataCopyExtParams m{static_cast<uint16_t>(t_.h),
-                              4 * t_.h, stride, 0, 0};
-    for (uint32_t token = 0; token < valid_; ++token) {
-      const uint64_t base = first + token;
-      DataCopyPad(comb_[base * t_.h * t_.h], matrix_[token * t_.h_pad], m);
-    }
-    if (hasMoreTiles) {
-      Sync<HardEvent::MTE3_MTE2>();
-    }
+    const DataCopyExtParams out{1, n * uint32_t{sizeof(float)}, 0, 0, 0};
+    DataCopyPad(comb_[first * t_.h * t_.h], dense_output_, out);
+    input_indexed_valid_ = 0;
+    if (hasMoreTiles) Sync<HardEvent::MTE3_MTE2>();
   }
 
   TPipe pipe_;
@@ -367,7 +483,7 @@ class NarrowP16ShortBatchKernel {
 template <int = 0>
 __global__ __aicore__ __attribute__((aligned(64))) void sinkhorn_f05_kernel(
     GM_ADDR mixes, GM_ADDR pre, GM_ADDR post, GM_ADDR comb,
-    sinkhorn_norm::TilingData tiling) {
+    sinkhorn_norm::ShortNarrowArgs tiling) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   sinkhorn_norm::f05::NarrowP16ShortBatchKernel op;
   op.Init(mixes, pre, post, comb, tiling);

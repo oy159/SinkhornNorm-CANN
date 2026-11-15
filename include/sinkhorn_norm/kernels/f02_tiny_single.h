@@ -7,7 +7,7 @@
 namespace sinkhorn_norm {
 using namespace AscendC;
 
-template <uint32_t H>
+template <uint32_t H, bool Tuned = false>
 class F02_TinySingle {
   static_assert(H >= 2 && H < 8, "Tiny single geometry family: H in [2, 7]");
   static constexpr uint32_t P = 8;
@@ -95,10 +95,12 @@ class F02_TinySingle {
     // underflow or overflow; no input tensor values are inspected on Host.
     if constexpr (MatrixOnly) {
       // Padding maps to the live first element of its row; masked math ignores it.
-      for (uint32_t c=0;c<8;++c) inputIndex.SetValue(c, c<H ? c*4 : 0);
+      if constexpr (Tuned) SeedPairs<4, H>(inputIndex.template ReinterpretCast<uint64_t>());
+      else for (uint32_t c=0;c<8;++c) inputIndex.SetValue(c, c<H ? c*4 : 0);
     }
     if (useFactors) {
-      for (uint32_t c=0;c<8;++c) transposeIndex_.SetValue(c,c*32);
+      if constexpr (Tuned) SeedPairs<32, P>(transposeIndex_.template ReinterpretCast<uint64_t>());
+      else for (uint32_t c=0;c<8;++c) transposeIndex_.SetValue(c,c*32);
     }
     if (MatrixOnly || useFactors) {
       Sync<HardEvent::S_V>();
@@ -129,11 +131,9 @@ class F02_TinySingle {
     // Execute interleaved GatePair + Softmax + Sinkhorn rounds + GatherMask
     // in one unbroken PIPE_V stream with a single terminal V_MTE3 sync.
     RunTinySingleFused<MatrixOnly>(iters, useFactors);
-    if constexpr (H < P) {
-      uint64_t packedCount = 0;
-      GatherMask(tmp_, matrix_[2 * P], pattern_, true, H * P, {1, 1, 8, 0},
-                 packedCount);
-    }
+    uint64_t packedCount = 0;
+    GatherMask(tmp_, matrix_[2 * P], pattern_, true, H * P, {1, 1, 8, 0},
+               packedCount);
 
     Sync<HardEvent::V_MTE3>();
     if constexpr (!MatrixOnly) {
@@ -141,18 +141,22 @@ class F02_TinySingle {
     DataCopyPad(preGm_[token * H], matrix_, gateCopy);
     DataCopyPad(postGm_[token * H], matrix_[P], gateCopy);
     }
-    if constexpr (H < P) {
-      const DataCopyExtParams matrixCopy{
-          1, H * H * uint32_t{sizeof(float)}, 0, 0, 0};
-      DataCopyPad(combGm_[token * H * H], tmp_, matrixCopy);
-    } else {
-      const DataCopyExtParams matrixCopy{
-          static_cast<uint16_t>(H), H * uint32_t{sizeof(float)}, 0, 0, 0};
-      DataCopyPad(combGm_[token * H * H], matrix_[2 * P], matrixCopy);
-    }
+    const DataCopyExtParams matrixCopy{
+        1, H * H * uint32_t{sizeof(float)}, 0, 0, 0};
+    DataCopyPad(combGm_[token * H * H], tmp_, matrixCopy);
   }
 
  private:
+  template <uint32_t Stride, uint32_t Live>
+  __aicore__ inline void SeedPairs(LocalTensor<uint64_t> indices) {
+    #pragma unroll
+    for (uint32_t c = 0; c < P; c += 2) {
+      const uint64_t low = c < Live ? c * Stride : 0;
+      const uint64_t high = c + 1 < Live ? (c + 1) * Stride : 0;
+      indices.SetValue(c / 2, low | (high << 32));
+    }
+  }
+
   template <HardEvent Event>
   __aicore__ inline void Sync() {
     SetFlag<Event>(EVENT_ID0);
@@ -168,6 +172,7 @@ class F02_TinySingle {
       auto *gTmp = reinterpret_cast<__ubuf__ float *>(gateTmp_.GetPhyAddr());
       auto *denom = reinterpret_cast<__ubuf__ float *>(denom_.GetPhyAddr());
       auto *result = reinterpret_cast<__ubuf__ float *>(result_.GetPhyAddr());
+      auto *p = reinterpret_cast<__ubuf__ float *>(rowFactor_.GetPhyAddr());
       auto *gNum = gTmp + 2 * P;
       auto *gDenom = gTmp + 4 * P;
 
@@ -178,7 +183,10 @@ class F02_TinySingle {
       SetVectorMask<float, MaskMode::NORMAL>(0, kGatePairMask);
       vmuls(gTmp, gates, -1.0f, 1, 1, 1, 8, 8);
       }
-      if constexpr (H < 7) {
+      if (useFactors) {
+        SetVectorMask<float, MaskMode::NORMAL>(0, ~kMask);
+        vector_dup(mat, 0.0f, 1, 1, 1, 8, 0);
+      } else if constexpr (H < 7) {
         constexpr uint64_t kZeroRowsMask = ~uint64_t{0} << (8 * (H + 1));
         SetVectorMask<float, MaskMode::NORMAL>(0, kZeroRowsMask);
         vector_dup(mat, 0.0f, 1, 1, 1, 8, 0);
@@ -191,6 +199,12 @@ class F02_TinySingle {
       if constexpr (!MatrixOnly) {
       SetVectorMask<float, MaskMode::NORMAL>(0, kGatePairMask);
       vmins(gTmp, gTmp, 80.0f, 1, 1, 1, 8, 8);
+      }
+      if (useFactors) {
+        SetVectorMask<float, MaskMode::NORMAL>(0, kPaddingDiagonal);
+        vector_dup(mat, 1.0f, 1, 1, 1, 8, 0);
+        SetVectorMask<float, MaskMode::NORMAL>(0, ~uint64_t{0});
+        vector_dup(p, 1.0f, 1, 1, 1, 8, 0);
       }
       vbrcb(reinterpret_cast<__ubuf__ uint32_t *>(tmp),
             reinterpret_cast<__ubuf__ uint32_t *>(result), 1, 8, 1);
@@ -236,10 +250,12 @@ class F02_TinySingle {
       // Window 7: Softmax vdiv [VDIV] || pre-populate col H of mat with eps_ and denom with eps_ [VALU]
       SetVectorMask<float, MaskMode::NORMAL>(0, kMask);
       vdiv(mat, mat, tmp, 1, 1, 1, 1, 8, 8, 8);
-      SetVectorMask<float, MaskMode::NORMAL>(0, kColHEpsMask);
-      vector_dup(mat, eps_, 1, 1, 1, 8, 0);
-      SetVectorMask<float, MaskMode::NORMAL>(0, (uint64_t{1} << H) - 1);
-      vector_dup(denom, eps_, 1, 1, 1, 8, 0);
+      if (!useFactors) {
+        SetVectorMask<float, MaskMode::NORMAL>(0, kColHEpsMask);
+        vector_dup(mat, eps_, 1, 1, 1, 8, 0);
+        SetVectorMask<float, MaskMode::NORMAL>(0, (uint64_t{1} << H) - 1);
+        vector_dup(denom, eps_, 1, 1, 1, 8, 0);
+      }
       pipe_barrier(PIPE_V);
 
       // Window 8: Softmax vadds(+eps), leaving active mask at kMask!
@@ -258,20 +274,9 @@ class F02_TinySingle {
       // The extra column carries epsilon; live entries of A and A^T stay fixed.
       // The initial Softmax already supplies the first row normalization.
       auto *at = reinterpret_cast<__ubuf__ float *>(transpose_.GetPhyAddr());
-      auto *p = reinterpret_cast<__ubuf__ float *>(rowFactor_.GetPhyAddr());
       auto *q = reinterpret_cast<__ubuf__ float *>(colFactor_.GetPhyAddr());
       auto *oldEps = reinterpret_cast<__ubuf__ float *>(epsFactor_.GetPhyAddr());
-      SetVectorMask<float, MaskMode::NORMAL>(0, ~kMask);
-      vector_dup(mat, 0.0f, 1, 1, 1, 8, 0);
-      pipe_barrier(PIPE_V);
-      SetVectorMask<float, MaskMode::NORMAL>(0, kPaddingDiagonal);
-      vector_dup(mat, 1.0f, 1, 1, 1, 8, 0);
       SetVectorMask<float, MaskMode::NORMAL>(0, ~uint64_t{0});
-      vector_dup(result, 0.0f, 1, 1, 1, 8, 0);
-      vector_dup(p, 1.0f, 1, 1, 1, 8, 0);
-      vector_dup(q, 1.0f, 1, 1, 1, 8, 0);
-      vector_dup(tmp, 0.0f, 1, 1, 1, 8, 0);
-      pipe_barrier(PIPE_V);
       Gather(transpose_, matrix_[2 * P], transposeIndex_, uint32_t{0}, uint32_t{64});
       pipe_barrier(PIPE_V);
       SetVectorMask<float, MaskMode::NORMAL>(0, ~uint64_t{0});
@@ -282,18 +287,54 @@ class F02_TinySingle {
       vector_dup(at, eps_, 1, 1, 1, 8, 0);
       pipe_barrier(PIPE_V);
       SetVectorMask<float, MaskMode::NORMAL>(0, ~uint64_t{0});
-      AugmentedHalf(at, mat, p, q, tmp, oldEps);
+      // The first column update divides by the unit row factor.
+      vcgadd(q, at, 1, 1, 1, 8);
+      pipe_barrier(PIPE_V);
+      const bool modelEnabled = iters >= 14 && eps_ >= 0x1p-24f && eps_ <= 0x1p-10f;
+      const uint32_t checkpoint = iters / 4;
+      auto oldState = LocalTensor<float>(TPosition::VECCALC, 3328, 64);
+      auto recentState = LocalTensor<float>(TPosition::VECCALC, 3584, 64);
+      auto *old = reinterpret_cast<__ubuf__ float *>(oldState.GetPhyAddr());
+      auto *recent = reinterpret_cast<__ubuf__ float *>(recentState.GetPhyAddr());
+      bool forecastApplied = false;
       for (uint32_t iter = 1; iter < iters; ++iter) {
-        AugmentedHalf(mat, at, q, p, tmp, oldEps);
-        AugmentedHalf(at, mat, p, q, tmp, oldEps);
+        if (modelEnabled && (iter + 1 == checkpoint || iter == checkpoint)) {
+          auto saved = iter == checkpoint ? recent : old;
+          AugmentedHalf(mat, at, q, p, tmp, oldEps, saved);
+          AugmentedHalf(at, mat, p, q, tmp, oldEps, saved + P);
+          if (iter == checkpoint) {
+            uint32_t steps = iters - iter - 1 - (Tuned ? 1 : 4);
+            if (TryTinyFactorForecast(p, q, old, recent, tmp, gTmp, result, steps)) {
+              if constexpr (Tuned) forecastApplied = true;
+              iter += steps;
+              RestoreTinyEpsilon(mat, at, p, q, oldEps, gTmp);
+            }
+          }
+        } else {
+          AugmentedHalf(mat, at, q, p, tmp, oldEps);
+          AugmentedHalf(at, mat, p, q, tmp, oldEps);
+        }
       }
       // Materialize the final output exactly once; no reciprocal approximation.
       SetVectorMask<float, MaskMode::NORMAL>(0, kMask);
-      vdiv(tmp, mat, q, 1, 1, 1, 0, 8, 8, 0);
-      vbrcb(reinterpret_cast<__ubuf__ uint32_t *>(gTmp),
-            reinterpret_cast<__ubuf__ uint32_t *>(p), 1, 8, 1);
-      pipe_barrier(PIPE_V);
-      vdiv(mat, tmp, gTmp, 1, 1, 1, 1, 8, 8, 8);
+      if constexpr (Tuned) {
+        // Long runs have already broadcast p during their last column update.
+        if (forecastApplied) {
+          vmul(tmp, oldEps, q, 1, 1, 1, 0, 8, 8, 0);
+          pipe_barrier(PIPE_V);
+          vdiv(mat, mat, tmp, 1, 1, 1, 1, 8, 8, 8);
+        } else {
+          vdiv(tmp, mat, q, 1, 1, 1, 0, 8, 8, 0);
+          pipe_barrier(PIPE_V);
+          vdiv(mat, tmp, oldEps, 1, 1, 1, 1, 8, 8, 8);
+        }
+      } else {
+        vdiv(tmp, mat, q, 1, 1, 1, 0, 8, 8, 0);
+        vbrcb(reinterpret_cast<__ubuf__ uint32_t *>(gTmp),
+              reinterpret_cast<__ubuf__ uint32_t *>(p), 1, 8, 1);
+        pipe_barrier(PIPE_V);
+        vdiv(mat, tmp, gTmp, 1, 1, 1, 1, 8, 8, 8);
+      }
       pipe_barrier(PIPE_V);
       ResetMask();
     }
@@ -332,14 +373,92 @@ class F02_TinySingle {
       }
   }
 
+  __aicore__ inline bool TryTinyFactorForecast(
+      __ubuf__ float *p, __ubuf__ float *q, __ubuf__ float *old,
+      __ubuf__ float *recent, __ubuf__ float *delta, __ubuf__ float *products,
+      __ubuf__ float *result, uint32_t &steps) {
+    constexpr auto live = kPreGateMask | kPostGateMask;
+    SetVectorMask<float, MaskMode::NORMAL>(0, kPreGateMask);
+    vsub(delta, p, recent, 1, 1, 1, 1, 8, 8, 8);
+    vsub(delta + P, q, recent + P, 1, 1, 1, 1, 8, 8, 8);
+    vmuls(products + 6 * P, p, -1.0f, 1, 1, 1, 8, 8);
+    vmuls(products + 7 * P, q, -1.0f, 1, 1, 1, 8, 8);
+    SetVectorMask<float, MaskMode::NORMAL>(0, live);
+    vsub(delta + 2 * P, recent, old, 1, 1, 1, 1, 8, 8, 8);
+    pipe_barrier(PIPE_V);
+    vmul(products, delta, delta + 2 * P, 1, 1, 1, 1, 8, 8, 8);
+    vmul(products + 2 * P, delta + 2 * P, delta + 2 * P, 1, 1, 1, 1, 8, 8, 8);
+    vmul(products + 4 * P, delta, delta, 1, 1, 1, 1, 8, 8, 8);
+    pipe_barrier(PIPE_V);
+    vcadd(result, products, 1, 1, 1, 8, 0);
+    vcadd(result + P, products + 2 * P, 1, 1, 1, 8, 0);
+    vcadd(result + 2 * P, products + 4 * P, 1, 1, 1, 8, 0);
+    vcgmax(result + 3 * P, products + 6 * P, 1, 1, 1, 8);
+    Sync<HardEvent::V_S>();
+
+    const float dot = result[0], before = result[P], now = result[2 * P];
+    const float rate = dot / before;
+    // Continue exact updates outside the observed positive, contracting
+    // range or when the two actual increments disagree with the model.
+    const bool fit = before > 0x1p-40f && now >= 0.0f && now <= 0x1p-14f &&
+                     rate >= 0.0f && rate <= 0.65f &&
+                     now - dot * rate <= 0.25f * now &&
+                     result[3 * P] <= -0.125f && result[3 * P + 1] <= -0.125f;
+    if (fit) {
+      float weight = 0.0f;
+      if constexpr (Tuned) {
+        if (now > 0x1p-18f || rate > 0.5f || now - dot * rate > 0.125f * now)
+          --steps;
+        const float squared = rate * rate;
+        const float pair = rate + squared;
+        for (uint32_t step = 0; step < steps / 2; ++step)
+          weight = pair + squared * weight;
+        if (steps % 2 != 0)
+          weight = rate * (1.0f + weight);
+      } else {
+        for (uint32_t step = 0; step < steps; ++step)
+          weight = rate * (1.0f + weight);
+      }
+      SetVectorMask<float, MaskMode::NORMAL>(0, kPreGateMask);
+      vaxpy(p, delta, weight, 1, 1, 1, 8, 8);
+      vaxpy(q, delta + P, weight, 1, 1, 1, 8, 8);
+      pipe_barrier(PIPE_V);
+    }
+    SetVectorMask<float, MaskMode::NORMAL>(0, ~uint64_t{0});
+    return fit;
+  }
+
+  __aicore__ inline void RestoreTinyEpsilon(
+      __ubuf__ float *mat, __ubuf__ float *at, __ubuf__ float *p,
+      __ubuf__ float *q, __ubuf__ float *rowBroadcast, __ubuf__ float *colBroadcast) {
+    SetVectorMask<float, MaskMode::NORMAL>(0, ~uint64_t{0});
+    vbrcb(reinterpret_cast<__ubuf__ uint32_t *>(rowBroadcast),
+          reinterpret_cast<__ubuf__ uint32_t *>(p), 1, 8, 1);
+    vbrcb(reinterpret_cast<__ubuf__ uint32_t *>(colBroadcast),
+          reinterpret_cast<__ubuf__ uint32_t *>(q), 1, 8, 1);
+    pipe_barrier(PIPE_V);
+    SetVectorMask<float, MaskMode::NORMAL>(0, kColHEpsMask);
+    vmuls(mat, rowBroadcast, eps_, 1, 1, 1, 8, 8);
+    vmuls(at, colBroadcast, eps_, 1, 1, 1, 8, 8);
+    pipe_barrier(PIPE_V);
+    SetVectorMask<float, MaskMode::NORMAL>(0, ~uint64_t{0});
+  }
+
   __aicore__ inline void AugmentedHalf(
       __ubuf__ float *a, __ubuf__ float *nextA,
       __ubuf__ float *other, __ubuf__ float *self,
-      __ubuf__ float *work, __ubuf__ float *broadcast) {
+      __ubuf__ float *work, __ubuf__ float *broadcast,
+      __ubuf__ float *previous = nullptr) {
     // Stage 1: weighted matrix and independent preparation for the next half.
     vdiv(work, a, other, 1, 1, 1, 0, 8, 8, 0);
     vbrcb(reinterpret_cast<__ubuf__ uint32_t *>(broadcast),
           reinterpret_cast<__ubuf__ uint32_t *>(other), 1, 8, 1);
+    if (previous) {
+      SetVectorMask<float, MaskMode::NORMAL>(0, kPreGateMask);
+      vcopy(reinterpret_cast<__ubuf__ uint32_t *>(previous),
+            reinterpret_cast<__ubuf__ uint32_t *>(self), 1, 1, 1, 8, 8);
+      SetVectorMask<float, MaskMode::NORMAL>(0, ~uint64_t{0});
+    }
     pipe_barrier(PIPE_V);
     // Stage 2: reduction includes epsilon; update only the opposite padding
     // column. Real matrix entries and padded identity rows remain unchanged.
@@ -584,6 +703,30 @@ __global__ __aicore__ __attribute__((aligned(64))) void sinkhorn_f02_kernel(
     }
   } else {
     sinkhorn_norm::F02_TinySingle<H> op;
+    op.Init(mixes, pre, post, comb, tiling.eps);
+    op.Process(tiling.iters);
+  }
+  PipeBarrier<PIPE_ALL>();
+}
+
+template <uint32_t H>
+__global__ __aicore__ __attribute__((aligned(64), section(".sinkhorn_tiny_long_entry")))
+void sinkhorn_f02_long_kernel(
+    GM_ADDR mixes, GM_ADDR pre, GM_ADDR post, GM_ADDR comb,
+    sinkhorn_norm::TilingData tiling) {
+  using namespace AscendC;
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  InitSocState();
+  if (GetBlockNum() == tiling.core_count + 1) {
+    if (GetBlockIdx() == tiling.core_count) {
+      sinkhorn_norm::RunBatchedGateRole<H>(mixes, pre, post, tiling.token_count, tiling.eps);
+    } else {
+      sinkhorn_norm::F02_TinySingle<H, true> op;
+      op.Init(mixes, pre, post, comb, tiling.eps);
+      op.template Process<true>(tiling.iters);
+    }
+  } else {
+    sinkhorn_norm::F02_TinySingle<H, true> op;
     op.Init(mixes, pre, post, comb, tiling.eps);
     op.Process(tiling.iters);
   }

@@ -3,6 +3,7 @@
 
 #include "kernel_operator.h"
 #include "sinkhorn_norm/tiling_data.h"
+#include "sinkhorn_norm/kernels/f03_h2_blocked.h"
 
 namespace sinkhorn_norm {
 namespace kernels {
@@ -365,54 +366,6 @@ class F03_TinyTokenPlanes {
     }
   }
 
-  __aicore__ inline void FusedTwoByTwoRound(uint32_t valid) {
-    auto m00 = Cell(0, 0);
-    auto m01 = Cell(0, 1);
-    auto m10 = Cell(1, 0);
-    auto m11 = Cell(1, 1);
-    Add(a_, m00, m01, valid);
-    Add(b_, m10, m11, valid);
-    PipeBarrier<PIPE_V>();
-    Adds(a_, a_, t_.eps, valid);
-    Adds(b_, b_, t_.eps, valid);
-    PipeBarrier<PIPE_V>();
-
-    Mul(c_, a_, b_, valid);
-    PipeBarrier<PIPE_V>();
-    Muls(c_, c_, t_.eps, valid);
-    Mul(m00, m00, b_, valid);
-    Mul(m01, m01, b_, valid);
-    Mul(m10, m10, a_, valid);
-    Mul(m11, m11, a_, valid);
-    PipeBarrier<PIPE_V>();
-    Add(a_, m00, m10, valid);
-    Add(b_, m01, m11, valid);
-    PipeBarrier<PIPE_V>();
-    Add(a_, a_, c_, valid);
-    Add(b_, b_, c_, valid);
-    PipeBarrier<PIPE_V>();
-    Div(m00, m00, a_, valid);
-    Div(m10, m10, a_, valid);
-    Div(m01, m01, b_, valid);
-    Div(m11, m11, b_, valid);
-    PipeBarrier<PIPE_V>();
-  }
-
-  __aicore__ inline void Columns(uint32_t valid) {
-    for (uint32_t col = 0; col < h_; ++col) {
-      Duplicate(c_, t_.eps, valid);
-      PipeBarrier<PIPE_V>();
-      for (uint32_t row = 0; row < h_; ++row) {
-        Add(c_, Cell(row, col), c_, valid);
-        PipeBarrier<PIPE_V>();
-      }
-      for (uint32_t row = 0; row < h_; ++row) {
-        Div(Cell(row, col), Cell(row, col), c_, valid);
-      }
-      PipeBarrier<PIPE_V>();
-    }
-  }
-
   TPipe pipe_;
   TBuf<TPosition::VECCALC> denseBuffer_, planeBuffer_, indexBuffer_,
       scratchBuffer_;
@@ -435,6 +388,16 @@ __global__ __aicore__ __attribute__((aligned(64))) void sinkhorn_f03_kernel(
   using namespace AscendC;
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
   InitSocState();
+  if (tiling.h == 2 && tiling.iters >= 2 && tiling.iters <= 4 &&
+      tiling.eps >= 0x1p-24f && tiling.eps <= 1.0e-3f) {
+    const uint32_t capacity = sinkhorn_norm::kernels::H2BlockedCapacity(tiling);
+    if (capacity >= 64) {
+      sinkhorn_norm::kernels::F03H2Blocked packed;
+      packed.Init(mixes, pre, post, comb, tiling, capacity);
+      packed.Process();
+      return;
+    }
+  }
   sinkhorn_norm::kernels::F03_TinyTokenPlanes op;
   op.Init(mixes, pre, post, comb, tiling,
           sinkhorn_norm::kernels::GetCompactPlaneCapacity(tiling));

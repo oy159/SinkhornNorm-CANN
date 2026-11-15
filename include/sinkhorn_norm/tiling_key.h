@@ -54,6 +54,8 @@ enum GeneralFallbackVariant : std::uint32_t {
   kGeneralWideTreeInverse = 6,
 };
 
+inline constexpr std::uint32_t kNarrowDenseFactorVariant = 1;
+
 // Reads only shape/iteration/eps metadata, ownership and allocated capacities.
 // Returns one exact compiled key; zero is reserved for no matching helper.
 TilingKey SelectTilingKey(std::uint32_t blocks, const TilingData &tiling,
@@ -66,16 +68,29 @@ TilingKey SelectTilingKey(std::uint32_t blocks, const TilingData &tiling,
 #define SINKHORN_TILING_KEY_CASES(X) \
   X(F09_MediumDenseIo, 0)            \
   X(F12_WideBlocked, 0)              \
-  X(F14_WideRotating128, 0)          \
   X(F04_NarrowSingle, 22)            \
   X(F01_TinySplit, 5)                \
   X(F13_WideQuarterStream, 0)        \
   X(F11_MediumAligned64, 0)          \
   X(F08_NarrowP24Recurrent, 1)       \
   X(F10_MediumCompact, 0)            \
-  X(F05_NarrowP16ShortBatch, 0)      \
   X(F06_NarrowP16PairedRows, 0)      \
-  X(F07_NarrowP16DenseIo, 0)         \
+  X(F05_NarrowP16ShortBatch, 0)      \
+  X(F07_NarrowP16DenseIo, 0)        \
+  X(F07_NarrowP16DenseIo, 38)       \
+  X(F07_NarrowP16DenseIo, 39)       \
+  X(F07_NarrowP16DenseIo, 42)       \
+  X(F07_NarrowP16DenseIo, 43)       \
+  X(F07_NarrowP16DenseIo, 46)       \
+  X(F07_NarrowP16DenseIo, 47)       \
+  X(F07_NarrowP16DenseIo, 50)       \
+  X(F07_NarrowP16DenseIo, 51)       \
+  X(F07_NarrowP16DenseIo, 54)       \
+  X(F07_NarrowP16DenseIo, 55)       \
+  X(F07_NarrowP16DenseIo, 58)       \
+  X(F07_NarrowP16DenseIo, 59)       \
+  X(F07_NarrowP16DenseIo, 62)       \
+  X(F07_NarrowP16DenseIo, 63)       \
   X(F02_TinySingle, 3)               \
   X(F02_TinySingle, 7)               \
   X(F02_TinySingle, 2)               \
@@ -94,6 +109,8 @@ TilingKey SelectTilingKey(std::uint32_t blocks, const TilingData &tiling,
   X(F00_GeneralFallback, 1)          \
   X(F00_GeneralFallback, 2)          \
   X(F00_GeneralFallback, 6)          \
-  X(F03_TinyTokenPlanes, 0)
+  X(F03_TinyTokenPlanes, 0)         \
+  X(F14_WideRotating128, 0)         \
+  X(F07_NarrowP16DenseIo, sinkhorn_norm::kNarrowDenseFactorVariant)
 
 #endif  // SINKHORN_NORM_TILING_KEY_H_
