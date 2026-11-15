@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.16)
+set(CMAKE_ASC_ARCHITECTURES "dav-2201" CACHE STRING "Target architecture")
+set(CMAKE_ASC_RUN_MODE "npu" CACHE STRING "Execution mode")
+find_package(ASC REQUIRED)
+project(sinkhorn_testbench LANGUAGES ASC CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(SINKHORN_TEST_REVISION "" CACHE STRING "Full tested Git commit SHA")
+string(LENGTH "${SINKHORN_TEST_REVISION}" revision_length)
+if(NOT revision_length EQUAL 40 OR NOT SINKHORN_TEST_REVISION MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR "SINKHORN_TEST_REVISION must be the full tested Git commit SHA")
+endif()
+add_executable(sinkhorn_tb main.asc)
+target_compile_definitions(sinkhorn_tb PRIVATE SINKHORN_TEST_REVISION="${SINKHORN_TEST_REVISION}")
+target_compile_options(sinkhorn_tb PRIVATE
+    $<$<COMPILE_LANGUAGE:ASC>:--npu-arch=${CMAKE_ASC_ARCHITECTURES}>)
+target_link_libraries(sinkhorn_tb PRIVATE
+    tiling_api register platform unified_dlog dl m graph_base)

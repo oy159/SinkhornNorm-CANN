@@ -1,11 +1,21 @@
+# Local build and editor files
 build/
+build-*/
 .DS_Store
 __pycache__/
 *.pyc
 .idea/
+.vscode/
 
-# CANNJudge credentials, sessions and local upload previews
+# Credentials and local judge state
 scripts/.cache/
-scripts/acounts.env
 scripts/accounts.env
-build-*/
+scripts/acounts.env
+.env
+
+# Private project instructions and development records
+AGENTS.md
+TEST_RESULTS.md
+history/
+logs/
+results/
